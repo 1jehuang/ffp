@@ -253,31 +253,32 @@ fn get_icon(filename: &str) -> &'static str {
         .unwrap_or("")
         .to_lowercase();
 
+    // Nerd Font icons using Unicode codepoints
     match ext.as_str() {
-        "pdf" => "",
-        "doc" | "docx" => "󰈬",
-        "md" => "",
-        "txt" => "",
-        "cpp" | "cc" | "cxx" => "",
-        "c" | "h" => "",
-        "py" => "",
-        "js" => "",
-        "ts" => "",
-        "rs" => "",
-        "go" => "",
-        "java" => "",
-        "sh" | "bash" | "zsh" => "",
-        "html" => "",
-        "css" => "",
-        "json" => "",
-        "yaml" | "yml" => "",
-        "toml" => "",
-        "png" | "jpg" | "jpeg" | "gif" | "svg" => "",
-        "mp3" | "wav" | "flac" => "",
-        "mp4" | "mkv" | "avi" => "",
-        "zip" | "tar" | "gz" | "xz" => "",
-        _ if filename.starts_with('.') => "",
-        _ => "",
+        "pdf" => "\u{f1c1}",           // nf-fa-file_pdf_o
+        "doc" | "docx" => "\u{f1c2}",  // nf-fa-file_word_o
+        "md" => "\u{e73e}",            // nf-dev-markdown
+        "txt" => "\u{f15c}",           // nf-fa-file_text_o
+        "cpp" | "cc" | "cxx" => "\u{e61d}", // nf-custom-cpp
+        "c" | "h" => "\u{e61e}",       // nf-custom-c
+        "py" => "\u{e73c}",            // nf-dev-python
+        "js" => "\u{e74e}",            // nf-dev-javascript
+        "ts" => "\u{e628}",            // nf-seti-typescript
+        "rs" => "\u{e7a8}",            // nf-dev-rust
+        "go" => "\u{e626}",            // nf-dev-go
+        "java" => "\u{e738}",          // nf-dev-java
+        "sh" | "bash" | "zsh" => "\u{e795}", // nf-dev-terminal
+        "html" => "\u{e736}",          // nf-dev-html5
+        "css" => "\u{e749}",           // nf-dev-css3
+        "json" => "\u{e60b}",          // nf-seti-json
+        "yaml" | "yml" => "\u{f481}",  // nf-oct-file_code
+        "toml" => "\u{e6b2}",          // nf-seti-config
+        "png" | "jpg" | "jpeg" | "gif" | "svg" => "\u{f1c5}", // nf-fa-file_image_o
+        "mp3" | "wav" | "flac" => "\u{f1c7}", // nf-fa-file_audio_o
+        "mp4" | "mkv" | "avi" => "\u{f1c8}", // nf-fa-file_video_o
+        "zip" | "tar" | "gz" | "xz" => "\u{f1c6}", // nf-fa-file_archive_o
+        _ if filename.starts_with('.') => "\u{f013}", // nf-fa-cog
+        _ => "\u{f15b}",               // nf-fa-file_o
     }
 }
 
