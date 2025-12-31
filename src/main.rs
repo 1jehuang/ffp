@@ -510,6 +510,18 @@ mod tests {
 }
 
 fn open_file(path: &str) -> Result<(), String> {
+    // Log to file for debugging
+    use std::io::Write;
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/ffp.log")
+        .ok();
+
+    if let Some(ref mut f) = log {
+        let _ = writeln!(f, "=== Opening: {} ===", path);
+    }
+
     let mime_output = Command::new("xdg-mime")
         .args(["query", "filetype", path])
         .output();
@@ -526,20 +538,51 @@ fn open_file(path: &str) -> Result<(), String> {
         })
         .unwrap_or_default();
 
+    if let Some(ref mut f) = log {
+        let _ = writeln!(f, "MIME: {}", mime_type);
+    }
+
     let is_text = if mime_type.is_empty() {
         is_text_extension(path)
     } else {
         is_text_mime(&mime_type)
     };
 
+    if let Some(ref mut f) = log {
+        let _ = writeln!(f, "is_text: {}", is_text);
+    }
+
     if is_text {
+        if let Some(ref mut f) = log {
+            let _ = writeln!(f, "Opening as text file");
+        }
         open_text_file(path)
     } else {
-        Command::new("xdg-open")
-            .arg(path)
-            .spawn()
-            .map_err(|e| format!("Failed to xdg-open: {}", e))?;
-        Ok(())
+        if let Some(ref mut f) = log {
+            let _ = writeln!(f, "Opening with xdg-open via setsid");
+        }
+        // Use setsid to fully detach the process so it survives after ffp exits
+        let result = Command::new("setsid")
+            .args(["--fork", "xdg-open", path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match result {
+            Ok(child) => {
+                if let Some(ref mut f) = log {
+                    let _ = writeln!(f, "setsid spawned, pid: {:?}", child.id());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(ref mut f) = log {
+                    let _ = writeln!(f, "setsid failed: {}", e);
+                }
+                Err(format!("Failed to xdg-open: {}", e))
+            }
+        }
     }
 }
 
