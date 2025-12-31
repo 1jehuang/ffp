@@ -723,7 +723,8 @@ fn main() -> io::Result<()> {
                             app.selected -= 1;
                         }
                     }
-                    (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('n'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                         if app.selected < app.matches.len().saturating_sub(1) {
                             app.selected += 1;
                         }
@@ -738,7 +739,8 @@ fn main() -> io::Result<()> {
                         app.query.clear();
                         app.selected = 0;
                     }
-                    (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('w'), KeyModifiers::CONTROL)
+                    | (KeyCode::Backspace, KeyModifiers::ALT) => {
                         // Delete word
                         while app.query.ends_with(' ') {
                             app.query.pop();
@@ -748,7 +750,7 @@ fn main() -> io::Result<()> {
                         }
                         app.selected = 0;
                     }
-                    (KeyCode::Backspace, _) => {
+                    (KeyCode::Backspace, KeyModifiers::NONE) => {
                         app.query.pop();
                         app.selected = 0;
                     }
