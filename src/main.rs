@@ -49,6 +49,8 @@ struct App {
     loading: Arc<Mutex<bool>>,
     last_query: String,
     last_file_count: usize,
+    preview_path: String,
+    preview_lines: Vec<String>,
 }
 
 impl App {
@@ -71,7 +73,18 @@ impl App {
             loading,
             last_query: String::new(),
             last_file_count: 0,
+            preview_path: String::new(),
+            preview_lines: Vec::new(),
         }
+    }
+
+    fn update_preview(&mut self) {
+        let current_path = self.selected_file().unwrap_or_default();
+        if current_path == self.preview_path {
+            return; // Already cached
+        }
+        self.preview_path = current_path.clone();
+        self.preview_lines = read_preview(&current_path, 10);
     }
 
     fn update_matches(&mut self) {
@@ -185,6 +198,51 @@ impl FileEntry {
             name_lower,
             dir,
         }
+    }
+}
+
+fn read_preview(path: &str, max_lines: usize) -> Vec<String> {
+    if path.is_empty() {
+        return vec!["No file selected".to_string()];
+    }
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return vec!["[Cannot read file]".to_string()],
+    };
+
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut bytes_read = 0;
+    const MAX_BYTES: usize = 4096; // Don't read too much
+
+    for line_result in reader.lines().take(max_lines) {
+        match line_result {
+            Ok(mut line) => {
+                bytes_read += line.len();
+                if bytes_read > MAX_BYTES {
+                    break;
+                }
+                // Check for binary content (null bytes)
+                if line.contains('\0') {
+                    return vec!["[Binary file]".to_string()];
+                }
+                // Truncate long lines
+                if line.len() > 60 {
+                    line = format!("{}...", &line[..57]);
+                }
+                // Replace tabs
+                line = line.replace('\t', "  ");
+                lines.push(line);
+            }
+            Err(_) => break,
+        }
+    }
+
+    if lines.is_empty() {
+        vec!["[Empty file]".to_string()]
+    } else {
+        lines
     }
 }
 
@@ -587,63 +645,58 @@ fn open_file(path: &str) -> Result<(), String> {
 }
 
 fn ui(frame: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+    let area = frame.area();
+    let wide_mode = area.width >= 100;
 
-    // Search input
-    let input = Paragraph::new(app.query.as_str())
-        .style(Style::default().fg(Color::White))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" ", Style::default().fg(Color::Cyan))),
-        );
-    frame.render_widget(input, chunks[0]);
+    // Build file list items
+    let (items, file_count): (Vec<ListItem>, usize) = {
+        let files = app.files.lock().unwrap();
+        let count = files.len();
+        let list: Vec<ListItem> = app
+            .matches
+            .iter()
+            .enumerate()
+            .take(DISPLAY_LIMIT)
+            .filter_map(|(i, matched)| {
+                let entry = files.get(matched.index)?;
+                let fname = entry.name.as_str();
+                let dir = entry.dir.as_str();
+                let icon = get_icon(fname);
 
-    // File list
-    let files = app.files.lock().unwrap();
-    let file_count = files.len();
-    let items: Vec<ListItem> = app
-        .matches
+                let style = if i == app.selected {
+                    Style::default()
+                        .bg(Color::Rgb(40, 44, 52))
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                let prefix = if i == app.selected { " " } else { "  " };
+
+                Some(ListItem::new(Line::from(vec![
+                    Span::styled(format!("{}{} ", prefix, icon), Style::default().fg(Color::Cyan)),
+                    Span::styled(fname.to_string(), style.add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                    Span::styled(dir.to_string(), Style::default().fg(Color::DarkGray)),
+                ]))
+                .style(style))
+            })
+            .collect();
+        (list, count)
+    };
+
+    // Build preview widget
+    let preview_lines: Vec<Line> = app
+        .preview_lines
         .iter()
-        .enumerate()
-        .take(DISPLAY_LIMIT)
-        .filter_map(|(i, matched)| {
-            let entry = files.get(matched.index)?;
-            let fname = entry.name.as_str();
-            let dir = entry.dir.as_str();
-            let icon = get_icon(fname);
-
-            let style = if i == app.selected {
-                Style::default()
-                    .bg(Color::Rgb(40, 44, 52))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-
-            let prefix = if i == app.selected { " " } else { "  " };
-
-            Some(ListItem::new(Line::from(vec![
-                Span::styled(format!("{}{} ", prefix, icon), Style::default().fg(Color::Cyan)),
-                Span::styled(fname, style.add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(dir, Style::default().fg(Color::DarkGray)),
-            ]))
-            .style(style))
-        })
+        .map(|s| Line::from(Span::styled(s.as_str(), Style::default().fg(Color::Gray))))
         .collect();
-
-    let list = List::new(items).block(Block::default());
-    frame.render_widget(list, chunks[1]);
+    let preview = Paragraph::new(preview_lines)
+        .block(Block::default().borders(Borders::ALL).title(Span::styled(
+            " Preview ",
+            Style::default().fg(Color::Yellow),
+        )));
 
     // Status line
     let status = format!(
@@ -655,31 +708,82 @@ fn ui(frame: &mut Frame, app: &App) {
     let status_widget = Paragraph::new(status)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(status_widget, chunks[2]);
 
-    // Keyboard help line
+    // Help line
     let help = Line::from(vec![
         Span::styled("Enter", Style::default().fg(Color::Cyan)),
         Span::raw(" open  "),
         Span::styled("Esc", Style::default().fg(Color::Cyan)),
         Span::raw(" cancel  "),
         Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-        Span::raw(" navigate  "),
+        Span::raw(" nav  "),
         Span::styled("^U", Style::default().fg(Color::Cyan)),
-        Span::raw(" clear  "),
-        Span::styled("^W", Style::default().fg(Color::Cyan)),
-        Span::raw(" del word"),
+        Span::raw(" clr"),
     ]);
     let help_widget = Paragraph::new(help)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(ratatui::layout::Alignment::Center);
-    frame.render_widget(help_widget, chunks[3]);
 
-    // Set cursor position
-    frame.set_cursor_position((
-        chunks[0].x + app.query.len() as u16 + 1,
-        chunks[0].y + 1,
-    ));
+    // Search input
+    let input = Paragraph::new(app.query.as_str())
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" ", Style::default().fg(Color::Cyan))),
+        );
+
+    if wide_mode {
+        // Wide: side-by-side layout
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(main_chunks[0]);
+
+        frame.render_widget(input, left_chunks[0]);
+        frame.render_widget(List::new(items).block(Block::default()), left_chunks[1]);
+        frame.render_widget(status_widget, left_chunks[2]);
+        frame.render_widget(help_widget, left_chunks[3]);
+        frame.render_widget(preview, main_chunks[1]);
+
+        frame.set_cursor_position((
+            left_chunks[0].x + app.query.len() as u16 + 1,
+            left_chunks[0].y + 1,
+        ));
+    } else {
+        // Narrow: preview at bottom
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(5),
+                Constraint::Length(8),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        frame.render_widget(input, chunks[0]);
+        frame.render_widget(List::new(items).block(Block::default()), chunks[1]);
+        frame.render_widget(preview, chunks[2]);
+        frame.render_widget(status_widget, chunks[3]);
+        frame.render_widget(help_widget, chunks[4]);
+
+        frame.set_cursor_position((
+            chunks[0].x + app.query.len() as u16 + 1,
+            chunks[0].y + 1,
+        ));
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -700,6 +804,7 @@ fn main() -> io::Result<()> {
 
     loop {
         app.update_matches();
+        app.update_preview();
         terminal.draw(|f| ui(f, &app))?;
 
         // Poll for events with timeout (for loading updates)
