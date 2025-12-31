@@ -593,6 +593,7 @@ fn ui(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(frame.area());
 
@@ -655,6 +656,24 @@ fn ui(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::DarkGray))
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(status_widget, chunks[2]);
+
+    // Keyboard help line
+    let help = Line::from(vec![
+        Span::styled("Enter", Style::default().fg(Color::Cyan)),
+        Span::raw(" open  "),
+        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" cancel  "),
+        Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+        Span::raw(" navigate  "),
+        Span::styled("^U", Style::default().fg(Color::Cyan)),
+        Span::raw(" clear  "),
+        Span::styled("^W", Style::default().fg(Color::Cyan)),
+        Span::raw(" del word"),
+    ]);
+    let help_widget = Paragraph::new(help)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help_widget, chunks[3]);
 
     // Set cursor position
     frame.set_cursor_position((
