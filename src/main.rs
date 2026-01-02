@@ -1,12 +1,14 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use image::GenericImageView;
 use rapidfuzz::fuzz::ratio;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
@@ -14,9 +16,10 @@ use ratatui::{
 };
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     env,
     fs,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     os::unix::fs::FileTypeExt,
     path::Path,
     process::{Command, Stdio},
@@ -28,6 +31,53 @@ use std::{
 const MATCH_LIMIT: usize = 50;
 const DISPLAY_LIMIT: usize = 30;
 const FILE_BATCH_SIZE: usize = 256;
+const IMAGE_CACHE_SIZE: usize = 10;
+const THUMBNAIL_MAX_WIDTH: u32 = 400;
+const THUMBNAIL_MAX_HEIGHT: u32 = 300;
+
+#[derive(Clone)]
+struct CachedImage {
+    data: Vec<u8>,  // PNG-encoded thumbnail
+    width: u32,
+    height: u32,
+}
+
+struct ImageCache {
+    cache: HashMap<String, CachedImage>,
+    order: Vec<String>,  // LRU order
+}
+
+impl ImageCache {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, path: &str) -> Option<&CachedImage> {
+        if self.cache.contains_key(path) {
+            // Move to end (most recently used)
+            self.order.retain(|p| p != path);
+            self.order.push(path.to_string());
+            self.cache.get(path)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, path: String, image: CachedImage) {
+        // Evict oldest if at capacity
+        while self.order.len() >= IMAGE_CACHE_SIZE {
+            if let Some(old) = self.order.first().cloned() {
+                self.cache.remove(&old);
+                self.order.remove(0);
+            }
+        }
+        self.order.push(path.clone());
+        self.cache.insert(path, image);
+    }
+}
 
 struct FileEntry {
     path: String,
@@ -41,6 +91,12 @@ struct MatchEntry {
     score: f64,
 }
 
+enum PreviewContent {
+    Text(Vec<String>),
+    Image(CachedImage),
+    None,
+}
+
 struct App {
     query: String,
     files: Arc<Mutex<Vec<FileEntry>>>,
@@ -50,7 +106,9 @@ struct App {
     last_query: String,
     last_file_count: usize,
     preview_path: String,
-    preview_lines: Vec<String>,
+    preview_content: PreviewContent,
+    image_cache: ImageCache,
+    preview_area: Option<Rect>,  // For kitty graphics positioning
 }
 
 impl App {
@@ -74,7 +132,9 @@ impl App {
             last_query: String::new(),
             last_file_count: 0,
             preview_path: String::new(),
-            preview_lines: Vec::new(),
+            preview_content: PreviewContent::None,
+            image_cache: ImageCache::new(),
+            preview_area: None,
         }
     }
 
@@ -84,7 +144,28 @@ impl App {
             return; // Already cached
         }
         self.preview_path = current_path.clone();
-        self.preview_lines = read_preview(&current_path, 10);
+
+        if current_path.is_empty() {
+            self.preview_content = PreviewContent::None;
+            return;
+        }
+
+        if is_image_file(&current_path) {
+            // Check cache first
+            if let Some(cached) = self.image_cache.get(&current_path) {
+                self.preview_content = PreviewContent::Image(cached.clone());
+                return;
+            }
+            // Load and cache image
+            if let Some(img) = load_thumbnail(&current_path) {
+                self.image_cache.insert(current_path.clone(), img.clone());
+                self.preview_content = PreviewContent::Image(img);
+            } else {
+                self.preview_content = PreviewContent::Text(vec!["[Cannot load image]".to_string()]);
+            }
+        } else {
+            self.preview_content = PreviewContent::Text(read_preview(&current_path, 40));
+        }
     }
 
     fn update_matches(&mut self) {
@@ -214,7 +295,7 @@ fn read_preview(path: &str, max_lines: usize) -> Vec<String> {
     let reader = BufReader::new(file);
     let mut lines = Vec::new();
     let mut bytes_read = 0;
-    const MAX_BYTES: usize = 4096; // Don't read too much
+    const MAX_BYTES: usize = 16384; // Allow larger previews
 
     for line_result in reader.lines().take(max_lines) {
         match line_result {
@@ -244,6 +325,102 @@ fn read_preview(path: &str, max_lines: usize) -> Vec<String> {
     } else {
         lines
     }
+}
+
+fn is_image_file(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico")
+}
+
+fn load_thumbnail(path: &str) -> Option<CachedImage> {
+    let img = image::open(path).ok()?;
+
+    // Calculate thumbnail size maintaining aspect ratio
+    let (orig_w, orig_h) = img.dimensions();
+    let scale = f64::min(
+        THUMBNAIL_MAX_WIDTH as f64 / orig_w as f64,
+        THUMBNAIL_MAX_HEIGHT as f64 / orig_h as f64,
+    );
+    let scale = scale.min(1.0); // Don't upscale
+
+    let new_w = (orig_w as f64 * scale) as u32;
+    let new_h = (orig_h as f64 * scale) as u32;
+
+    // Use fast resize filter for speed
+    let thumbnail = img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+
+    // Encode to PNG for kitty protocol
+    let mut png_data = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut png_data);
+    thumbnail.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+
+    Some(CachedImage {
+        data: png_data,
+        width: new_w,
+        height: new_h,
+    })
+}
+
+/// Render image using kitty graphics protocol
+fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
+    let mut stdout = io::stdout();
+
+    // Clear previous image in this area
+    // Using kitty's delete command for images at specific position
+    write!(stdout, "\x1b_Ga=d,d=a\x1b\\")?;
+
+    // Encode image data as base64
+    let b64_data = BASE64.encode(&img.data);
+
+    // Calculate cell dimensions (assuming ~2:1 aspect ratio for terminal cells)
+    let cols = area.width as u32;
+    let rows = area.height as u32;
+
+    // Send image in chunks (kitty protocol limit is 4096 bytes per chunk)
+    let chunk_size = 4096;
+    let chunks: Vec<&str> = b64_data.as_bytes()
+        .chunks(chunk_size)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i == chunks.len() - 1;
+        if i == 0 {
+            // First chunk: include image metadata
+            write!(
+                stdout,
+                "\x1b_Ga=T,f=100,t=d,c={},r={},m={};{}\x1b\\",
+                cols,
+                rows,
+                if is_last { 0 } else { 1 },
+                chunk
+            )?;
+        } else {
+            // Continuation chunks
+            write!(
+                stdout,
+                "\x1b_Gm={};{}\x1b\\",
+                if is_last { 0 } else { 1 },
+                chunk
+            )?;
+        }
+    }
+
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Clear any kitty graphics at the given area
+fn clear_kitty_image() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b_Ga=d,d=a\x1b\\")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 fn get_icon(filename: &str) -> &'static str {
@@ -645,7 +822,7 @@ fn open_file(path: &str) -> Result<(), String> {
     }
 }
 
-fn ui(frame: &mut Frame, app: &App) {
+fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
     let area = frame.area();
     let wide_mode = area.width >= 100;
 
@@ -687,15 +864,26 @@ fn ui(frame: &mut Frame, app: &App) {
         (list, count)
     };
 
-    // Build preview widget
-    let preview_lines: Vec<Line> = app
-        .preview_lines
-        .iter()
-        .map(|s| Line::from(Span::styled(s.as_str(), Style::default().fg(Color::Gray))))
-        .collect();
+    // Build preview widget (for text content)
+    let (preview_lines, is_image): (Vec<Line>, bool) = match &app.preview_content {
+        PreviewContent::Text(lines) => (
+            lines.iter()
+                .map(|s| Line::from(Span::styled(s.as_str(), Style::default().fg(Color::Gray))))
+                .collect(),
+            false,
+        ),
+        PreviewContent::Image(_) => (
+            vec![Line::from(Span::styled("[Image preview below]", Style::default().fg(Color::Green)))],
+            true,
+        ),
+        PreviewContent::None => (
+            vec![Line::from(Span::styled("No file selected", Style::default().fg(Color::DarkGray)))],
+            false,
+        ),
+    };
     let preview = Paragraph::new(preview_lines)
         .block(Block::default().borders(Borders::ALL).title(Span::styled(
-            " Preview ",
+            if is_image { "  Image " } else { " Preview " },
             Style::default().fg(Color::Yellow),
         )));
 
@@ -734,7 +922,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 .title(Span::styled(" ", Style::default().fg(Color::Cyan))),
         );
 
-    if wide_mode {
+    let preview_area = if wide_mode {
         // Wide: side-by-side layout
         let main_chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -761,16 +949,20 @@ fn ui(frame: &mut Frame, app: &App) {
             left_chunks[0].x + app.query.len() as u16 + 1,
             left_chunks[0].y + 1,
         ));
+
+        main_chunks[1]
     } else {
         // Narrow: preview at bottom
+        // List height matches actual items, preview gets remaining space
+        let list_height = (items.len() as u16).max(1);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Min(5),
-                Constraint::Length(8),
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(3),           // input
+                Constraint::Length(list_height), // file list (sized to content)
+                Constraint::Min(3),              // preview (gets remaining space)
+                Constraint::Length(1),           // status
+                Constraint::Length(1),           // help
             ])
             .split(area);
 
@@ -784,6 +976,15 @@ fn ui(frame: &mut Frame, app: &App) {
             chunks[0].x + app.query.len() as u16 + 1,
             chunks[0].y + 1,
         ));
+
+        chunks[2]
+    };
+
+    // Return preview area if we have an image to render
+    if is_image {
+        Some(preview_area)
+    } else {
+        None
     }
 }
 
@@ -803,10 +1004,35 @@ fn main() -> io::Result<()> {
     let mut app = App::new();
     let mut chosen: Option<String> = None;
 
+    let mut last_image_area: Option<Rect> = None;
+
     loop {
         app.update_matches();
         app.update_preview();
-        terminal.draw(|f| ui(f, &app))?;
+
+        let mut image_area: Option<Rect> = None;
+        terminal.draw(|f| {
+            image_area = ui(f, &app);
+        })?;
+
+        // Render kitty graphics for image preview
+        if let Some(area) = image_area {
+            if let PreviewContent::Image(ref img) = app.preview_content {
+                // Adjust area for border (1 cell padding)
+                let inner = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1,
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                };
+                let _ = render_kitty_image(img, inner);
+                last_image_area = Some(area);
+            }
+        } else if last_image_area.is_some() {
+            // Clear previous image when switching to non-image
+            let _ = clear_kitty_image();
+            last_image_area = None;
+        }
 
         // Poll for events with timeout (for loading updates)
         if event::poll(Duration::from_millis(100))? {
@@ -869,6 +1095,9 @@ fn main() -> io::Result<()> {
             }
         }
     }
+
+    // Clear any kitty graphics before exiting
+    let _ = clear_kitty_image();
 
     // Restore terminal
     disable_raw_mode()?;
