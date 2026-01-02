@@ -705,6 +705,59 @@ fn run_profile() -> io::Result<()> {
         );
     }
 
+    // Profile image loading
+    eprintln!("\n=== Image Loading Profile ===");
+    let image_files: Vec<_> = files.iter()
+        .filter(|f| is_image_file(&f.path))
+        .take(5)
+        .collect();
+
+    if image_files.is_empty() {
+        eprintln!("No image files found in recent files");
+    } else {
+        for file in &image_files {
+            let start = Instant::now();
+            let result = load_thumbnail(&file.path);
+            let duration = start.elapsed();
+
+            match result {
+                Some(img) => {
+                    eprintln!(
+                        "profile: image {:?} -> {}x{} thumb, {} bytes in {:?}",
+                        file.name,
+                        img.width,
+                        img.height,
+                        img.data.len(),
+                        duration
+                    );
+                }
+                None => {
+                    eprintln!("profile: image {:?} -> FAILED in {:?}", file.name, duration);
+                }
+            }
+        }
+
+        // Profile cached access
+        eprintln!("\n=== Cached Image Access ===");
+        let mut cache = ImageCache::new();
+
+        // First load (cold)
+        if let Some(first) = image_files.first() {
+            let start = Instant::now();
+            if let Some(img) = load_thumbnail(&first.path) {
+                let load_time = start.elapsed();
+                cache.insert(first.path.clone(), img);
+                eprintln!("profile: cold load {:?} in {:?}", first.name, load_time);
+
+                // Cached access (hot)
+                let start = Instant::now();
+                let _ = cache.get(&first.path);
+                let cache_time = start.elapsed();
+                eprintln!("profile: hot cache access {:?} in {:?}", first.name, cache_time);
+            }
+        }
+    }
+
     Ok(())
 }
 
