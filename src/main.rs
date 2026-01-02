@@ -84,6 +84,7 @@ struct FileEntry {
     name: String,
     name_lower: String,
     dir: String,
+    mtime: SystemTime,
 }
 
 struct MatchEntry {
@@ -250,6 +251,9 @@ fn load_files(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>) {
         let _ = child.wait();
     }
 
+    // Sort by mtime descending (most recent first)
+    files.lock().unwrap().sort_by(|a, b| b.mtime.cmp(&a.mtime));
+
     *loading.lock().unwrap() = false;
 }
 
@@ -272,12 +276,16 @@ impl FileEntry {
         let name = basename(&path).to_string();
         let dir = dirname(&path).to_string();
         let name_lower = name.to_lowercase();
+        let mtime = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
 
         Self {
             path,
             name,
             name_lower,
             dir,
+            mtime,
         }
     }
 }
@@ -368,16 +376,20 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
 
 /// Render image using kitty graphics protocol
 fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
+    use crossterm::cursor::MoveTo;
+
     let mut stdout = io::stdout();
 
-    // Clear previous image in this area
-    // Using kitty's delete command for images at specific position
+    // Clear previous image
     write!(stdout, "\x1b_Ga=d,d=a\x1b\\")?;
+
+    // Move cursor to the preview area (1-indexed for terminal, but crossterm uses 0-indexed)
+    execute!(stdout, MoveTo(area.x, area.y))?;
 
     // Encode image data as base64
     let b64_data = BASE64.encode(&img.data);
 
-    // Calculate cell dimensions (assuming ~2:1 aspect ratio for terminal cells)
+    // Calculate cell dimensions
     let cols = area.width as u32;
     let rows = area.height as u32;
 
@@ -392,9 +404,11 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
         let is_last = i == chunks.len() - 1;
         if i == 0 {
             // First chunk: include image metadata
+            // f=100 means PNG format, a=T means transmit and display
+            // c=cols, r=rows specifies the cell area to fill
             write!(
                 stdout,
-                "\x1b_Ga=T,f=100,t=d,c={},r={},m={};{}\x1b\\",
+                "\x1b_Ga=T,f=100,c={},r={},m={};{}\x1b\\",
                 cols,
                 rows,
                 if is_last { 0 } else { 1 },
