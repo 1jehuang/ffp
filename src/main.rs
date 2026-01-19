@@ -376,15 +376,10 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
 
 /// Render image using kitty graphics protocol
 fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
-    use crossterm::cursor::MoveTo;
-
     let mut stdout = io::stdout();
 
     // Clear previous image
     write!(stdout, "\x1b_Ga=d,d=a\x1b\\")?;
-
-    // Move cursor to the preview area (1-indexed for terminal, but crossterm uses 0-indexed)
-    execute!(stdout, MoveTo(area.x, area.y))?;
 
     // Encode image data as base64
     let b64_data = BASE64.encode(&img.data);
