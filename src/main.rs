@@ -36,8 +36,8 @@ const FILE_BATCH_SIZE: usize = 256;
 const IMAGE_CACHE_SIZE: usize = 10;
 const THUMBNAIL_MAX_WIDTH: u32 = 800;
 const THUMBNAIL_MAX_HEIGHT: u32 = 600;
-const VIDEO_PREVIEW_FRAMES: usize = 15;
-const VIDEO_FRAME_INTERVAL_MS: u64 = 200;
+const VIDEO_PREVIEW_FRAMES: usize = 75;
+const VIDEO_FRAME_INTERVAL_MS: u64 = 66;
 
 #[derive(Clone)]
 struct CachedImage {
@@ -419,10 +419,29 @@ fn is_video_file(path: &str) -> bool {
     matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v")
 }
 
+fn get_video_duration(path: &str) -> Option<f64> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.trim().parse::<f64>().ok()
+}
+
 fn load_video_frames(path: &str) -> Option<Vec<CachedImage>> {
+    let duration = get_video_duration(path).unwrap_or(5.0);
+    // Spread frames evenly across the whole video
+    let fps = (VIDEO_PREVIEW_FRAMES as f64 / duration).max(0.5);
     let scale_filter = format!(
-        "fps=3,scale={}:{}:force_original_aspect_ratio=decrease",
-        THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT
+        "fps={:.4},scale={}:{}:force_original_aspect_ratio=decrease",
+        fps, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT
     );
     let output = Command::new("ffmpeg")
         .args([
@@ -567,8 +586,8 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
 fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
     let mut stdout = io::stdout();
 
-    // Delete previous image and display new one atomically
-    write!(stdout, "\x1b_Ga=d,d=a\x1b\\")?;
+    // Save cursor position, delete previous image
+    write!(stdout, "\x1b7\x1b_Ga=d,d=a\x1b\\")?;
 
     // Calculate display cells that preserve aspect ratio.
     // Terminal cells are ~2x taller than wide, so we correct for that.
@@ -632,6 +651,8 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
         }
     }
 
+    // Restore cursor position
+    write!(stdout, "\x1b8")?;
     stdout.flush()?;
     Ok(())
 }
@@ -1152,12 +1173,22 @@ fn build_file_items<'a>(
             let (icon, icon_color) = get_icon(fname);
             let time = time_ago(entry.mtime);
 
+            // Split filename into stem and extension
+            let p = Path::new(fname);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(fname);
+            let ext_part = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|e| format!(".{}", e))
+                .unwrap_or_default();
+
             Some(ListItem::new(Line::from(vec![
                 Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
                 Span::styled(
-                    fname.to_string(),
+                    stem.to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(ext_part, Style::default().fg(icon_color)),
                 Span::styled(
                     format!(" {}", time),
                     Style::default().fg(Color::Rgb(80, 80, 80)),
