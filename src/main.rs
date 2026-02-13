@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -11,9 +11,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -29,11 +32,12 @@ use std::{
 };
 
 const MATCH_LIMIT: usize = 50;
-const DISPLAY_LIMIT: usize = 30;
 const FILE_BATCH_SIZE: usize = 256;
 const IMAGE_CACHE_SIZE: usize = 10;
-const THUMBNAIL_MAX_WIDTH: u32 = 400;
-const THUMBNAIL_MAX_HEIGHT: u32 = 300;
+const THUMBNAIL_MAX_WIDTH: u32 = 800;
+const THUMBNAIL_MAX_HEIGHT: u32 = 600;
+const VIDEO_PREVIEW_FRAMES: usize = 15;
+const VIDEO_FRAME_INTERVAL_MS: u64 = 200;
 
 #[derive(Clone)]
 struct CachedImage {
@@ -87,14 +91,16 @@ struct FileEntry {
     mtime: SystemTime,
 }
 
+#[derive(Clone)]
 struct MatchEntry {
     index: usize,
     score: f64,
 }
 
 enum PreviewContent {
-    Text(Vec<String>),
+    Text(Vec<Line<'static>>),
     Image(CachedImage),
+    Video(Vec<CachedImage>),
     None,
 }
 
@@ -102,14 +108,19 @@ struct App {
     query: String,
     files: Arc<Mutex<Vec<FileEntry>>>,
     matches: Vec<MatchEntry>,
+    matches_by_time: Vec<MatchEntry>,
     selected: usize,
+    active_column: usize, // 0 = ranked, 1 = recent
     loading: Arc<Mutex<bool>>,
     last_query: String,
     last_file_count: usize,
     preview_path: String,
     preview_content: PreviewContent,
     image_cache: ImageCache,
-    preview_area: Option<Rect>,  // For kitty graphics positioning
+    video_frame: usize,
+    video_frame_time: Instant,
+    syntax_set: SyntaxSet,
+    theme: syntect::highlighting::Theme,
 }
 
 impl App {
@@ -124,18 +135,27 @@ impl App {
             load_files(files_clone, loading_clone);
         });
 
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let mut ts = ThemeSet::load_defaults();
+        let theme = ts.themes.remove("base16-ocean.dark").unwrap();
+
         Self {
             query: String::new(),
             files,
             matches: Vec::new(),
+            matches_by_time: Vec::new(),
             selected: 0,
+            active_column: 0,
             loading,
             last_query: String::new(),
             last_file_count: 0,
             preview_path: String::new(),
             preview_content: PreviewContent::None,
             image_cache: ImageCache::new(),
-            preview_area: None,
+            video_frame: 0,
+            video_frame_time: Instant::now(),
+            syntax_set,
+            theme,
         }
     }
 
@@ -151,21 +171,42 @@ impl App {
             return;
         }
 
-        if is_image_file(&current_path) {
+        if is_video_file(&current_path) {
+            if let Some(frames) = load_video_frames(&current_path) {
+                self.video_frame = 0;
+                self.video_frame_time = Instant::now();
+                self.preview_content = PreviewContent::Video(frames);
+            } else {
+                self.preview_content = PreviewContent::Text(vec![
+                    Line::from(Span::styled("[Cannot load video]", Style::default().fg(Color::DarkGray)))
+                ]);
+            }
+        } else if is_image_file(&current_path) {
             // Check cache first
             if let Some(cached) = self.image_cache.get(&current_path) {
                 self.preview_content = PreviewContent::Image(cached.clone());
                 return;
             }
-            // Load and cache image
             if let Some(img) = load_thumbnail(&current_path) {
                 self.image_cache.insert(current_path.clone(), img.clone());
                 self.preview_content = PreviewContent::Image(img);
             } else {
-                self.preview_content = PreviewContent::Text(vec!["[Cannot load image]".to_string()]);
+                self.preview_content = PreviewContent::Text(vec![
+                    Line::from(Span::styled("[Cannot load image]", Style::default().fg(Color::DarkGray)))
+                ]);
             }
         } else {
-            self.preview_content = PreviewContent::Text(read_preview(&current_path, 40));
+            let lines = read_preview(&current_path, 40);
+            // Error/info messages (single line starting with '[') stay plain
+            if lines.len() == 1 && lines[0].starts_with('[') {
+                self.preview_content = PreviewContent::Text(vec![
+                    Line::from(Span::styled(lines[0].clone(), Style::default().fg(Color::DarkGray)))
+                ]);
+            } else {
+                self.preview_content = PreviewContent::Text(
+                    highlight_preview(&lines, &current_path, &self.syntax_set, &self.theme)
+                );
+            }
         }
     }
 
@@ -180,6 +221,20 @@ impl App {
         }
 
         self.matches = fuzzy_match(&self.query, &files, MATCH_LIMIT);
+
+        // Time-sorted column: same matches, sorted by mtime then score
+        self.matches_by_time = self.matches.clone();
+        self.matches_by_time.sort_by(|a, b| {
+            files[b.index]
+                .mtime
+                .cmp(&files[a.index].mtime)
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(Ordering::Equal)
+                })
+        });
+
         self.last_query = self.query.clone();
         self.last_file_count = files_len;
         if self.selected >= self.matches.len() {
@@ -189,18 +244,27 @@ impl App {
 
     fn selected_file(&self) -> Option<String> {
         let files = self.files.lock().unwrap();
-        self.matches
+        let matches = if self.active_column == 0 {
+            &self.matches
+        } else {
+            &self.matches_by_time
+        };
+        matches
             .get(self.selected)
             .and_then(|m| files.get(m.index))
             .map(|entry| entry.path.clone())
     }
 
-    fn is_loading(&self) -> bool {
-        *self.loading.lock().unwrap()
+    fn active_matches(&self) -> &[MatchEntry] {
+        if self.active_column == 0 {
+            &self.matches
+        } else {
+            &self.matches_by_time
+        }
     }
 
-    fn file_count(&self) -> usize {
-        self.files.lock().unwrap().len()
+    fn is_loading(&self) -> bool {
+        *self.loading.lock().unwrap()
     }
 }
 
@@ -345,6 +409,131 @@ fn is_image_file(path: &str) -> bool {
     matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico")
 }
 
+fn is_video_file(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v")
+}
+
+fn load_video_frames(path: &str) -> Option<Vec<CachedImage>> {
+    let scale_filter = format!(
+        "fps=3,scale={}:{}:force_original_aspect_ratio=decrease",
+        THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT
+    );
+    let output = Command::new("ffmpeg")
+        .args([
+            "-i", path,
+            "-vf", &scale_filter,
+            "-frames:v", &VIDEO_PREVIEW_FRAMES.to_string(),
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+
+    // Split concatenated PNG stream by PNG magic bytes
+    let png_magic: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let data = &output.stdout;
+    let mut frames = Vec::new();
+    let mut start = 0;
+
+    for i in 1..data.len().saturating_sub(7) {
+        if data[i..i + 8] == png_magic {
+            let frame_data = data[start..i].to_vec();
+            if let Ok(img) = image::load_from_memory(&frame_data) {
+                let (w, h) = img.dimensions();
+                frames.push(CachedImage { data: frame_data, width: w, height: h });
+            }
+            start = i;
+        }
+    }
+    // Last frame
+    if start < data.len() {
+        let frame_data = data[start..].to_vec();
+        if let Ok(img) = image::load_from_memory(&frame_data) {
+            let (w, h) = img.dimensions();
+            frames.push(CachedImage { data: frame_data, width: w, height: h });
+        }
+    }
+
+    if frames.is_empty() { None } else { Some(frames) }
+}
+
+fn time_ago(mtime: SystemTime) -> String {
+    match mtime.elapsed() {
+        Ok(elapsed) => {
+            let secs = elapsed.as_secs();
+            if secs < 60 {
+                format!("{}s", secs)
+            } else if secs < 3600 {
+                format!("{}m", secs / 60)
+            } else if secs < 86400 {
+                format!("{}h", secs / 3600)
+            } else {
+                format!("{}d", secs / 86400)
+            }
+        }
+        Err(_) => "0s".to_string(),
+    }
+}
+
+fn highlight_preview(
+    lines: &[String],
+    path: &str,
+    ss: &SyntaxSet,
+    theme: &syntect::highlighting::Theme,
+) -> Vec<Line<'static>> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    let syntax = ss
+        .find_syntax_by_extension(ext)
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let mut h = HighlightLines::new(syntax, theme);
+
+    lines
+        .iter()
+        .map(|line| {
+            match h.highlight_line(line, ss) {
+                Ok(ranges) => {
+                    let spans: Vec<Span<'static>> = ranges
+                        .into_iter()
+                        .map(|(style, text)| {
+                            let fg = Color::Rgb(
+                                style.foreground.r,
+                                style.foreground.g,
+                                style.foreground.b,
+                            );
+                            Span::styled(text.to_string(), Style::default().fg(fg))
+                        })
+                        .collect();
+                    Line::from(spans)
+                }
+                Err(_) => {
+                    Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::Gray),
+                    ))
+                }
+            }
+        })
+        .collect()
+}
+
 fn load_thumbnail(path: &str) -> Option<CachedImage> {
     let img = image::open(path).ok()?;
 
@@ -378,19 +567,46 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
 fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
     let mut stdout = io::stdout();
 
-    // Clear previous image
+    // Delete previous image and display new one atomically
     write!(stdout, "\x1b_Ga=d,d=a\x1b\\")?;
+
+    // Calculate display cells that preserve aspect ratio.
+    // Terminal cells are ~2x taller than wide, so we correct for that.
+    let cell_ratio = 2.0_f64; // cell_height / cell_width in pixels
+    let img_ratio = (img.width as f64 / img.height as f64) * cell_ratio;
+    let area_ratio = area.width as f64 / area.height as f64;
+
+    let (cols, rows) = if img_ratio > area_ratio {
+        // Image is wider than area — fit to width
+        let c = area.width as u32;
+        let r = ((c as f64) / img_ratio).max(1.0) as u32;
+        (c, r.min(area.height as u32))
+    } else {
+        // Image is taller than area — fit to height
+        let r = area.height as u32;
+        let c = ((r as f64) * img_ratio).max(1.0) as u32;
+        (c.min(area.width as u32), r)
+    };
+
+    // Center the image in the available area
+    let offset_x = (area.width as u32).saturating_sub(cols) / 2;
+    let offset_y = (area.height as u32).saturating_sub(rows) / 2;
+
+    // Move cursor to centered position (1-indexed)
+    write!(
+        stdout,
+        "\x1b[{};{}H",
+        area.y as u32 + 1 + offset_y,
+        area.x as u32 + 1 + offset_x
+    )?;
 
     // Encode image data as base64
     let b64_data = BASE64.encode(&img.data);
 
-    // Calculate cell dimensions
-    let cols = area.width as u32;
-    let rows = area.height as u32;
-
     // Send image in chunks (kitty protocol limit is 4096 bytes per chunk)
     let chunk_size = 4096;
-    let chunks: Vec<&str> = b64_data.as_bytes()
+    let chunks: Vec<&str> = b64_data
+        .as_bytes()
         .chunks(chunk_size)
         .map(|c| std::str::from_utf8(c).unwrap_or(""))
         .collect();
@@ -398,9 +614,6 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
     for (i, chunk) in chunks.iter().enumerate() {
         let is_last = i == chunks.len() - 1;
         if i == 0 {
-            // First chunk: include image metadata
-            // f=100 means PNG format, a=T means transmit and display
-            // c=cols, r=rows specifies the cell area to fill
             write!(
                 stdout,
                 "\x1b_Ga=T,f=100,c={},r={},m={};{}\x1b\\",
@@ -410,7 +623,6 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
                 chunk
             )?;
         } else {
-            // Continuation chunks
             write!(
                 stdout,
                 "\x1b_Gm={};{}\x1b\\",
@@ -432,39 +644,83 @@ fn clear_kitty_image() -> io::Result<()> {
     Ok(())
 }
 
-fn get_icon(filename: &str) -> &'static str {
+fn get_icon(filename: &str) -> (&'static str, Color) {
     let ext = Path::new(filename)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    // Nerd Font icons using Unicode codepoints
     match ext.as_str() {
-        "pdf" => "\u{f1c1}",           // nf-fa-file_pdf_o
-        "doc" | "docx" => "\u{f1c2}",  // nf-fa-file_word_o
-        "md" => "\u{e73e}",            // nf-dev-markdown
-        "txt" => "\u{f15c}",           // nf-fa-file_text_o
-        "cpp" | "cc" | "cxx" => "\u{e61d}", // nf-custom-cpp
-        "c" | "h" => "\u{e61e}",       // nf-custom-c
-        "py" => "\u{e73c}",            // nf-dev-python
-        "js" => "\u{e74e}",            // nf-dev-javascript
-        "ts" => "\u{e628}",            // nf-seti-typescript
-        "rs" => "\u{e7a8}",            // nf-dev-rust
-        "go" => "\u{e626}",            // nf-dev-go
-        "java" => "\u{e738}",          // nf-dev-java
-        "sh" | "bash" | "zsh" => "\u{e795}", // nf-dev-terminal
-        "html" => "\u{e736}",          // nf-dev-html5
-        "css" => "\u{e749}",           // nf-dev-css3
-        "json" => "\u{e60b}",          // nf-seti-json
-        "yaml" | "yml" => "\u{f481}",  // nf-oct-file_code
-        "toml" => "\u{e6b2}",          // nf-seti-config
-        "png" | "jpg" | "jpeg" | "gif" | "svg" => "\u{f1c5}", // nf-fa-file_image_o
-        "mp3" | "wav" | "flac" => "\u{f1c7}", // nf-fa-file_audio_o
-        "mp4" | "mkv" | "avi" => "\u{f1c8}", // nf-fa-file_video_o
-        "zip" | "tar" | "gz" | "xz" => "\u{f1c6}", // nf-fa-file_archive_o
-        _ if filename.starts_with('.') => "\u{f013}", // nf-fa-cog
-        _ => "\u{f15b}",               // nf-fa-file_o
+        // Documents
+        "pdf" => ("\u{f1c1}", Color::Red),
+        "doc" | "docx" => ("\u{f1c2}", Color::Blue),
+        "xls" | "xlsx" => ("\u{f1c3}", Color::Green),
+        "ppt" | "pptx" => ("\u{f1c4}", Color::Rgb(255, 120, 0)),
+        "md" => ("\u{e73e}", Color::White),
+        "txt" | "log" => ("\u{f15c}", Color::White),
+        "tex" | "latex" => ("\u{f15c}", Color::Green),
+        // Programming languages
+        "rs" => ("\u{e7a8}", Color::Rgb(222, 165, 132)),
+        "py" => ("\u{e73c}", Color::Rgb(55, 118, 171)),
+        "js" | "mjs" | "cjs" => ("\u{e74e}", Color::Yellow),
+        "ts" | "mts" => ("\u{e628}", Color::Rgb(49, 120, 198)),
+        "tsx" | "jsx" => ("\u{e7ba}", Color::Cyan),
+        "cpp" | "cc" | "cxx" | "hpp" => ("\u{e61d}", Color::Rgb(0, 89, 156)),
+        "c" | "h" => ("\u{e61e}", Color::Rgb(85, 85, 205)),
+        "go" => ("\u{e626}", Color::Cyan),
+        "java" => ("\u{e738}", Color::Rgb(176, 114, 25)),
+        "kt" | "kts" => ("\u{e634}", Color::Rgb(150, 75, 210)),
+        "swift" => ("\u{e755}", Color::Rgb(255, 106, 51)),
+        "rb" => ("\u{e739}", Color::Red),
+        "php" => ("\u{e73d}", Color::Rgb(119, 123, 180)),
+        "lua" => ("\u{e620}", Color::Blue),
+        "zig" => ("\u{f0e7}", Color::Rgb(247, 164, 29)),
+        "nim" => ("\u{f005}", Color::Yellow),
+        "hs" | "lhs" => ("\u{e777}", Color::Rgb(94, 80, 134)),
+        "ml" | "mli" | "ocaml" => ("\u{e63a}", Color::Rgb(238, 122, 0)),
+        "ex" | "exs" => ("\u{e62d}", Color::Rgb(110, 74, 128)),
+        "erl" => ("\u{e7b1}", Color::Red),
+        "r" | "R" => ("\u{f25d}", Color::Rgb(39, 108, 194)),
+        "scala" => ("\u{e737}", Color::Red),
+        "dart" => ("\u{e798}", Color::Cyan),
+        "v" | "sv" | "svh" => ("\u{f085}", Color::Rgb(0, 140, 140)),
+        // Shell & config
+        "sh" | "bash" | "zsh" | "fish" => ("\u{e795}", Color::Green),
+        "nix" => ("\u{f313}", Color::Rgb(126, 186, 228)),
+        // Web
+        "html" | "htm" => ("\u{e736}", Color::Rgb(228, 77, 38)),
+        "css" | "scss" | "sass" | "less" => ("\u{e749}", Color::Rgb(86, 61, 124)),
+        "vue" => ("\u{e6a0}", Color::Green),
+        "svelte" => ("\u{e697}", Color::Rgb(255, 62, 0)),
+        // Data & config
+        "json" | "jsonc" => ("\u{e60b}", Color::Yellow),
+        "yaml" | "yml" => ("\u{f481}", Color::Rgb(203, 56, 55)),
+        "toml" => ("\u{e6b2}", Color::Rgb(156, 66, 33)),
+        "xml" | "xsl" => ("\u{e796}", Color::Rgb(228, 77, 38)),
+        "csv" => ("\u{f1c3}", Color::Green),
+        "sql" => ("\u{f1c0}", Color::Rgb(0, 116, 143)),
+        "graphql" | "gql" => ("\u{e662}", Color::Rgb(229, 53, 171)),
+        "proto" => ("\u{f481}", Color::Cyan),
+        // Build & package
+        "dockerfile" => ("\u{e7b0}", Color::Rgb(56, 134, 200)),
+        "lock" => ("\u{f023}", Color::DarkGray),
+        // Media
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" | "tiff"
+            => ("\u{f1c5}", Color::Rgb(160, 100, 210)),
+        "mp3" | "wav" | "flac" | "ogg" | "aac" | "m4a" | "wma"
+            => ("\u{f1c7}", Color::Rgb(255, 87, 51)),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v"
+            => ("\u{f1c8}", Color::Rgb(253, 216, 53)),
+        // Archives
+        "zip" | "tar" | "gz" | "xz" | "bz2" | "7z" | "rar" | "zst" | "deb" | "rpm"
+            => ("\u{f1c6}", Color::Rgb(175, 135, 0)),
+        // Fonts
+        "ttf" | "otf" | "woff" | "woff2" => ("\u{f031}", Color::White),
+        // Misc
+        "bin" | "exe" | "so" | "dylib" | "dll" => ("\u{f013}", Color::Green),
+        _ if filename.starts_with('.') => ("\u{f013}", Color::DarkGray),
+        _ => ("\u{f15b}", Color::DarkGray),
     }
 }
 
@@ -514,7 +770,7 @@ fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry
 }
 
 fn is_text_mime(mime_type: &str) -> bool {
-    if mime_type.starts_with("text/") {
+    if mime_type.starts_with("text/") && mime_type != "text/html" {
         return true;
     }
 
@@ -579,7 +835,6 @@ fn is_text_extension(path: &str) -> bool {
             | "sh"
             | "bash"
             | "zsh"
-            | "html"
             | "css"
             | "xml"
             | "csv"
@@ -884,70 +1139,92 @@ fn open_file(path: &str) -> Result<(), String> {
     }
 }
 
+fn build_file_items<'a>(
+    matches: &[MatchEntry],
+    files: &[FileEntry],
+) -> Vec<ListItem<'a>> {
+    matches
+        .iter()
+        .filter_map(|matched| {
+            let entry = files.get(matched.index)?;
+            let fname = &entry.name;
+            let dir = &entry.dir;
+            let (icon, icon_color) = get_icon(fname);
+            let time = time_ago(entry.mtime);
+
+            Some(ListItem::new(Line::from(vec![
+                Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
+                Span::styled(
+                    fname.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", time),
+                    Style::default().fg(Color::Rgb(80, 80, 80)),
+                ),
+                Span::raw(" "),
+                Span::styled(dir.to_string(), Style::default().fg(Color::DarkGray)),
+            ])))
+        })
+        .collect()
+}
+
 fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
     let area = frame.area();
     let wide_mode = area.width >= 100;
+    let dual_columns = area.width >= 140;
 
-    // Build file list items
-    let (items, file_count): (Vec<ListItem>, usize) = {
+    // Build file list items (all matches, scrolling handled by ListState)
+    let (score_items, time_items, file_count) = {
         let files = app.files.lock().unwrap();
         let count = files.len();
-        let list: Vec<ListItem> = app
-            .matches
-            .iter()
-            .enumerate()
-            .take(DISPLAY_LIMIT)
-            .filter_map(|(i, matched)| {
-                let entry = files.get(matched.index)?;
-                let fname = entry.name.as_str();
-                let dir = entry.dir.as_str();
-                let icon = get_icon(fname);
-
-                let style = if i == app.selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 44, 52))
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
-                let prefix = if i == app.selected { " " } else { "  " };
-
-                Some(ListItem::new(Line::from(vec![
-                    Span::styled(format!("{}{} ", prefix, icon), Style::default().fg(Color::Cyan)),
-                    Span::styled(fname.to_string(), style.add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                    Span::styled(dir.to_string(), Style::default().fg(Color::DarkGray)),
-                ]))
-                .style(style))
-            })
-            .collect();
-        (list, count)
+        let score_list = build_file_items(&app.matches, &files);
+        let time_list = build_file_items(&app.matches_by_time, &files);
+        (score_list, time_list, count)
     };
 
+    // ListState for scrolling in the active column
+    let highlight_style = Style::default()
+        .bg(Color::Rgb(40, 44, 52))
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let mut score_state = ListState::default();
+    let mut time_state = ListState::default();
+    if app.active_column == 0 {
+        score_state.select(Some(app.selected));
+    } else {
+        time_state.select(Some(app.selected));
+    }
+
     // Build preview widget (for text content)
-    let (preview_lines, is_image): (Vec<Line>, bool) = match &app.preview_content {
-        PreviewContent::Text(lines) => (
-            lines.iter()
-                .map(|s| Line::from(Span::styled(s.as_str(), Style::default().fg(Color::Gray))))
-                .collect(),
-            false,
-        ),
-        PreviewContent::Image(_) => (
-            vec![Line::from(Span::styled("[Image preview below]", Style::default().fg(Color::Green)))],
+    let (preview_lines, needs_graphics): (Vec<Line>, bool) = match &app.preview_content {
+        PreviewContent::Text(lines) => (lines.clone(), false),
+        PreviewContent::Image(_) => (vec![], true),
+        PreviewContent::Video(frames) => (
+            vec![Line::from(Span::styled(
+                format!(" {}/{}", app.video_frame + 1, frames.len()),
+                Style::default().fg(Color::Green),
+            ))],
             true,
         ),
         PreviewContent::None => (
-            vec![Line::from(Span::styled("No file selected", Style::default().fg(Color::DarkGray)))],
+            vec![Line::from(Span::styled(
+                "No file selected",
+                Style::default().fg(Color::DarkGray),
+            ))],
             false,
         ),
     };
-    let preview = Paragraph::new(preview_lines)
-        .block(Block::default().borders(Borders::ALL).title(Span::styled(
-            if is_image { "  Image " } else { " Preview " },
-            Style::default().fg(Color::Yellow),
-        )));
+    let preview_title = match &app.preview_content {
+        PreviewContent::Video(_) => " Video ",
+        PreviewContent::Image(_) => " Image ",
+        _ => " Preview ",
+    };
+    let preview = Paragraph::new(preview_lines).block(
+        Block::default()
+            .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+            .title(Span::styled(preview_title, Style::default().fg(Color::Yellow))),
+    );
 
     // Status line
     let status = format!(
@@ -966,7 +1243,7 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         Span::raw(" open  "),
         Span::styled("Esc", Style::default().fg(Color::Cyan)),
         Span::raw(" cancel  "),
-        Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan)),
         Span::raw(" nav  "),
         Span::styled("^U", Style::default().fg(Color::Cyan)),
         Span::raw(" clr"),
@@ -980,11 +1257,68 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" ", Style::default().fg(Color::Cyan))),
+                .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                .title(Span::styled(" \u{f002} ", Style::default().fg(Color::Cyan))),
         );
 
-    let preview_area = if wide_mode {
+    let preview_area = if dual_columns {
+        // Extra wide: dual file columns + preview
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(main_chunks[0]);
+
+        // Split file area into two columns
+        let file_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(left_chunks[1]);
+
+        frame.render_widget(input, left_chunks[0]);
+        frame.render_stateful_widget(
+            List::new(score_items)
+                .highlight_style(highlight_style)
+                .highlight_symbol(" ")
+                .block(
+                    Block::default()
+                        .borders(Borders::RIGHT).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                        .title(Span::styled(" Ranked ", Style::default().fg(Color::Cyan))),
+                ),
+            file_cols[0],
+            &mut score_state,
+        );
+        frame.render_stateful_widget(
+            List::new(time_items)
+                .highlight_style(highlight_style)
+                .highlight_symbol(" ")
+                .block(
+                    Block::default()
+                        .title(Span::styled(" Recent ", Style::default().fg(Color::Cyan))),
+                ),
+            file_cols[1],
+            &mut time_state,
+        );
+        frame.render_widget(status_widget, left_chunks[2]);
+        frame.render_widget(help_widget, left_chunks[3]);
+        frame.render_widget(preview, main_chunks[1]);
+
+        frame.set_cursor_position((
+            left_chunks[0].x + app.query.len() as u16 + 1,
+            left_chunks[0].y + 1,
+        ));
+
+        main_chunks[1]
+    } else if wide_mode {
         // Wide: side-by-side layout
         let main_chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -1002,7 +1336,14 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
             .split(main_chunks[0]);
 
         frame.render_widget(input, left_chunks[0]);
-        frame.render_widget(List::new(items).block(Block::default()), left_chunks[1]);
+        frame.render_stateful_widget(
+            List::new(score_items)
+                .highlight_style(highlight_style)
+                .highlight_symbol(" ")
+                .block(Block::default()),
+            left_chunks[1],
+            &mut score_state,
+        );
         frame.render_widget(status_widget, left_chunks[2]);
         frame.render_widget(help_widget, left_chunks[3]);
         frame.render_widget(preview, main_chunks[1]);
@@ -1014,22 +1355,27 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
 
         main_chunks[1]
     } else {
-        // Narrow: preview at bottom
-        // List height matches actual items, preview gets remaining space
-        let list_height = (items.len() as u16).max(1);
+        // Narrow: list and preview split vertically
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),           // input
-                Constraint::Length(list_height), // file list (sized to content)
-                Constraint::Min(3),              // preview (gets remaining space)
-                Constraint::Length(1),           // status
-                Constraint::Length(1),           // help
+                Constraint::Length(3),
+                Constraint::Percentage(50),
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(area);
 
         frame.render_widget(input, chunks[0]);
-        frame.render_widget(List::new(items).block(Block::default()), chunks[1]);
+        frame.render_stateful_widget(
+            List::new(score_items)
+                .highlight_style(highlight_style)
+                .highlight_symbol(" ")
+                .block(Block::default()),
+            chunks[1],
+            &mut score_state,
+        );
         frame.render_widget(preview, chunks[2]);
         frame.render_widget(status_widget, chunks[3]);
         frame.render_widget(help_widget, chunks[4]);
@@ -1042,8 +1388,7 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         chunks[2]
     };
 
-    // Return preview area if we have an image to render
-    if is_image {
+    if needs_graphics {
         Some(preview_area)
     } else {
         None
@@ -1067,6 +1412,8 @@ fn main() -> io::Result<()> {
     let mut chosen: Option<String> = None;
 
     let mut last_image_area: Option<Rect> = None;
+    let mut last_rendered_path = String::new();
+    let mut last_video_frame: usize = usize::MAX;
 
     loop {
         app.update_matches();
@@ -1077,28 +1424,62 @@ fn main() -> io::Result<()> {
             image_area = ui(f, &app);
         })?;
 
-        // Render kitty graphics for image preview
+        // Render kitty graphics for image/video preview
         if let Some(area) = image_area {
-            if let PreviewContent::Image(ref img) = app.preview_content {
-                // Adjust area for border (1 cell padding)
-                let inner = Rect {
-                    x: area.x + 1,
-                    y: area.y + 1,
-                    width: area.width.saturating_sub(2),
-                    height: area.height.saturating_sub(2),
-                };
-                let _ = render_kitty_image(img, inner);
-                last_image_area = Some(area);
+            let inner = Rect {
+                x: area.x + 1,
+                y: area.y + 1,
+                width: area.width.saturating_sub(2),
+                height: area.height.saturating_sub(2),
+            };
+            match &app.preview_content {
+                PreviewContent::Image(ref img) => {
+                    // Only re-render if the image changed
+                    if app.preview_path != last_rendered_path {
+                        let _ = render_kitty_image(img, inner);
+                        last_rendered_path = app.preview_path.clone();
+                    }
+                    last_image_area = Some(area);
+                }
+                PreviewContent::Video(ref frames) => {
+                    // Advance frame on timer
+                    if app.video_frame_time.elapsed()
+                        >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS)
+                    {
+                        app.video_frame = (app.video_frame + 1) % frames.len();
+                        app.video_frame_time = Instant::now();
+                    }
+                    // Only re-render if frame changed
+                    if app.video_frame != last_video_frame
+                        || app.preview_path != last_rendered_path
+                    {
+                        if let Some(frame) = frames.get(app.video_frame) {
+                            let _ = render_kitty_image(frame, inner);
+                        }
+                        last_video_frame = app.video_frame;
+                        last_rendered_path = app.preview_path.clone();
+                    }
+                    last_image_area = Some(area);
+                }
+                _ => {}
             }
         } else if last_image_area.is_some() {
-            // Clear previous image when switching to non-image
             let _ = clear_kitty_image();
             last_image_area = None;
+            last_rendered_path.clear();
+            last_video_frame = usize::MAX;
         }
 
-        // Poll for events with timeout (for loading updates)
-        if event::poll(Duration::from_millis(100))? {
+        // Poll with shorter timeout for smooth video, longer for static content
+        let poll_ms = match &app.preview_content {
+            PreviewContent::Video(_) => 16, // ~60fps
+            _ => 100,
+        };
+        if event::poll(Duration::from_millis(poll_ms))? {
             if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) => break,
                     (KeyCode::Enter, _) => {
@@ -1108,7 +1489,7 @@ fn main() -> io::Result<()> {
                         break;
                     }
                     (KeyCode::Down, _) | (KeyCode::Tab, KeyModifiers::NONE) => {
-                        if app.selected < app.matches.len().saturating_sub(1) {
+                        if app.selected < app.active_matches().len().saturating_sub(1) {
                             app.selected += 1;
                         }
                     }
@@ -1119,7 +1500,7 @@ fn main() -> io::Result<()> {
                     }
                     (KeyCode::Char('n'), KeyModifiers::CONTROL)
                     | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                        if app.selected < app.matches.len().saturating_sub(1) {
+                        if app.selected < app.active_matches().len().saturating_sub(1) {
                             app.selected += 1;
                         }
                     }
@@ -1127,6 +1508,28 @@ fn main() -> io::Result<()> {
                     | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                         if app.selected > 0 {
                             app.selected -= 1;
+                        }
+                    }
+                    (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                        if app.active_column != 0 {
+                            app.active_column = 0;
+                            app.selected = 0;
+                        }
+                    }
+                    (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                        if app.active_column != 1 {
+                            app.active_column = 1;
+                            app.selected = 0;
+                        }
+                    }
+                    (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+                        if let Some(file) = app.selected_file() {
+                            let _ = Command::new("wl-copy")
+                                .arg(&file)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .spawn();
                         }
                     }
                     (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
