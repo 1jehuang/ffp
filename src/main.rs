@@ -101,6 +101,7 @@ enum PreviewContent {
     Text(Vec<Line<'static>>),
     Image(CachedImage),
     Video(Vec<CachedImage>),
+    VideoLoading,
     None,
 }
 
@@ -119,6 +120,8 @@ struct App {
     image_cache: ImageCache,
     video_frame: usize,
     video_frame_time: Instant,
+    video_loader: Option<Arc<Mutex<Option<Vec<CachedImage>>>>>,
+    video_loader_path: String,
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
 }
@@ -154,6 +157,8 @@ impl App {
             image_cache: ImageCache::new(),
             video_frame: 0,
             video_frame_time: Instant::now(),
+            video_loader: None,
+            video_loader_path: String::new(),
             syntax_set,
             theme,
         }
@@ -162,9 +167,31 @@ impl App {
     fn update_preview(&mut self) {
         let current_path = self.selected_file().unwrap_or_default();
         if current_path == self.preview_path {
-            return; // Already cached
+            // Check if async video loader finished
+            let loaded_frames = self.video_loader.as_ref().and_then(|loader| {
+                loader.lock().unwrap().take()
+            });
+            if let Some(frames) = loaded_frames {
+                self.video_loader = None;
+                if !frames.is_empty() {
+                    self.video_frame = 0;
+                    self.video_frame_time = Instant::now();
+                    self.preview_content = PreviewContent::Video(frames);
+                } else {
+                    self.preview_content = PreviewContent::Text(vec![
+                        Line::from(Span::styled("[Cannot load video]", Style::default().fg(Color::DarkGray)))
+                    ]);
+                }
+            }
+            return;
         }
         self.preview_path = current_path.clone();
+
+        // Cancel any in-flight video loader for a different path
+        if self.video_loader_path != current_path {
+            self.video_loader = None;
+            self.video_loader_path.clear();
+        }
 
         if current_path.is_empty() {
             self.preview_content = PreviewContent::None;
@@ -172,15 +199,16 @@ impl App {
         }
 
         if is_video_file(&current_path) {
-            if let Some(frames) = load_video_frames(&current_path) {
-                self.video_frame = 0;
-                self.video_frame_time = Instant::now();
-                self.preview_content = PreviewContent::Video(frames);
-            } else {
-                self.preview_content = PreviewContent::Text(vec![
-                    Line::from(Span::styled("[Cannot load video]", Style::default().fg(Color::DarkGray)))
-                ]);
-            }
+            let result = Arc::new(Mutex::new(None));
+            let result_clone = Arc::clone(&result);
+            let path = current_path.clone();
+            thread::spawn(move || {
+                let frames = load_video_frames(&path).unwrap_or_default();
+                *result_clone.lock().unwrap() = Some(frames);
+            });
+            self.video_loader = Some(result);
+            self.video_loader_path = current_path.clone();
+            self.preview_content = PreviewContent::VideoLoading;
         } else if is_image_file(&current_path) {
             // Check cache first
             if let Some(cached) = self.image_cache.get(&current_path) {
@@ -380,9 +408,10 @@ fn read_preview(path: &str, max_lines: usize) -> Vec<String> {
                 if line.contains('\0') {
                     return vec!["[Binary file]".to_string()];
                 }
-                // Truncate long lines
-                if line.len() > 60 {
-                    line = format!("{}...", &line[..57]);
+                // Truncate long lines (char-aware to avoid splitting multi-byte chars)
+                if line.chars().count() > 60 {
+                    let truncated: String = line.chars().take(57).collect();
+                    line = format!("{}...", truncated);
                 }
                 // Replace tabs
                 line = line.replace('\t', "  ");
@@ -1238,6 +1267,13 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
             ))],
             true,
         ),
+        PreviewContent::VideoLoading => (
+            vec![Line::from(Span::styled(
+                "Loading video...",
+                Style::default().fg(Color::Yellow),
+            ))],
+            false,
+        ),
         PreviewContent::None => (
             vec![Line::from(Span::styled(
                 "No file selected",
@@ -1247,7 +1283,7 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         ),
     };
     let preview_title = match &app.preview_content {
-        PreviewContent::Video(_) => " Video ",
+        PreviewContent::Video(_) | PreviewContent::VideoLoading => " Video ",
         PreviewContent::Image(_) => " Image ",
         _ => " Preview ",
     };
@@ -1504,6 +1540,7 @@ fn main() -> io::Result<()> {
         // Poll with shorter timeout for smooth video, longer for static content
         let poll_ms = match &app.preview_content {
             PreviewContent::Video(_) => 16, // ~60fps
+            PreviewContent::VideoLoading => 50, // check for loaded frames frequently
             _ => 100,
         };
         if event::poll(Duration::from_millis(poll_ms))? {
