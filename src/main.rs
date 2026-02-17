@@ -40,9 +40,9 @@ const VIDEO_PREVIEW_FRAMES: usize = 75;
 const VIDEO_FRAME_INTERVAL_MS: u64 = 66;
 const VIDEO_CACHE_SIZE: usize = 5;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CachedImage {
-    data: Vec<u8>,  // JPEG or PNG-encoded thumbnail
+    data: Vec<u8>,
     width: u32,
     height: u32,
 }
@@ -497,48 +497,68 @@ fn get_video_duration(path: &str) -> Option<f64> {
     s.trim().parse::<f64>().ok()
 }
 
-fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    let mut i = 2;
-    while i + 4 < data.len() {
-        if data[i] != 0xFF {
-            return None;
-        }
-        let marker = data[i + 1];
-        if marker == 0xD9 {
-            return None;
-        }
-        if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
-            if i + 9 < data.len() {
-                let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
-                let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
-                return Some((w, h));
-            }
-        }
-        if i + 3 < data.len() {
-            let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
-            i += 2 + len;
-        } else {
-            return None;
-        }
+fn get_video_dimensions(path: &str) -> Option<(u32, u32)> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+            path,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = s.trim().split('x').collect();
+    if parts.len() == 2 {
+        let w = parts[0].parse::<u32>().ok()?;
+        let h = parts[1].parse::<u32>().ok()?;
+        Some((w, h))
+    } else {
+        None
     }
-    None
+}
+
+fn compute_scaled_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let scale = f64::min(
+        max_w as f64 / src_w as f64,
+        max_h as f64 / src_h as f64,
+    ).min(1.0);
+    let w = ((src_w as f64 * scale) as u32) & !1; // even for ffmpeg
+    let h = ((src_h as f64 * scale) as u32) & !1;
+    (w.max(2), h.max(2))
+}
+
+fn encode_rgb_to_jpeg(rgb_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let img = image::RgbImage::from_raw(width, height, rgb_data.to_vec())?;
+    let mut jpeg_buf = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut cursor, image::ImageFormat::Jpeg)
+        .ok()?;
+    Some(jpeg_buf)
 }
 
 fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
     let duration = get_video_duration(path).unwrap_or(5.0);
+    let (src_w, src_h) = get_video_dimensions(path).unwrap_or((640, 480));
+    let (out_w, out_h) = compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+    let frame_size = (out_w * out_h * 3) as usize;
+
     let fps = (VIDEO_PREVIEW_FRAMES as f64 / duration).max(0.5);
     let scale_filter = format!(
-        "fps={:.4},scale={}:{}:force_original_aspect_ratio=decrease",
-        fps, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT
+        "fps={:.4},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
+        fps, out_w, out_h, out_w, out_h
     );
     let mut child = match Command::new("ffmpeg")
         .args([
             "-i", path,
             "-vf", &scale_filter,
             "-frames:v", &VIDEO_PREVIEW_FRAMES.to_string(),
-            "-f", "image2pipe",
-            "-vcodec", "mjpeg",
-            "-q:v", "5",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
             "-",
         ])
         .stdout(Stdio::piped())
@@ -554,11 +574,11 @@ fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
     };
 
     let mut reader = BufReader::with_capacity(256 * 1024, stdout);
-    let mut buf = Vec::with_capacity(512 * 1024);
+    let mut buf = Vec::with_capacity(frame_size * 2);
     let mut frame_count = 0;
 
     loop {
-        let mut tmp = [0u8; 32768];
+        let mut tmp = [0u8; 65536];
         let n = match io::Read::read(&mut reader, &mut tmp) {
             Ok(0) => break,
             Ok(n) => n,
@@ -566,53 +586,21 @@ fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
         };
         buf.extend_from_slice(&tmp[..n]);
 
-        // Split on JPEG SOI markers (0xFF 0xD8)
-        loop {
-            if buf.len() < 4 {
-                break;
+        while buf.len() >= frame_size {
+            let raw_frame: Vec<u8> = buf.drain(..frame_size).collect();
+            if let Some(jpeg_data) = encode_rgb_to_jpeg(&raw_frame, out_w, out_h) {
+                shared.lock().unwrap().push(CachedImage {
+                    data: jpeg_data,
+                    width: out_w,
+                    height: out_h,
+                });
             }
-            // Find next SOI after position 2 (skip the first SOI of current frame)
-            let mut split_at = None;
-            for i in 2..buf.len().saturating_sub(1) {
-                if buf[i] == 0xFF && buf[i + 1] == 0xD8 {
-                    split_at = Some(i);
-                    break;
-                }
+            frame_count += 1;
+            if frame_count >= VIDEO_PREVIEW_FRAMES {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
             }
-            match split_at {
-                Some(pos) => {
-                    let frame_data: Vec<u8> = buf.drain(..pos).collect();
-                    if frame_data.len() > 2 {
-                        let (w, h) = jpeg_dimensions(&frame_data).unwrap_or((0, 0));
-                        if w > 0 && h > 0 {
-                            shared.lock().unwrap().push(CachedImage {
-                                data: frame_data,
-                                width: w,
-                                height: h,
-                            });
-                            frame_count += 1;
-                            if frame_count >= VIDEO_PREVIEW_FRAMES {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                return;
-                            }
-                        }
-                    }
-                }
-                None => break,
-            }
-        }
-    }
-
-    // Flush last frame
-    if buf.len() > 2 {
-        let (w, h) = jpeg_dimensions(&buf).unwrap_or((0, 0));
-        if w > 0 && h > 0 {
-            shared.lock().unwrap().push(CachedImage {
-                data: buf,
-                width: w,
-                height: h,
-            });
         }
     }
 
@@ -1088,6 +1076,14 @@ fn open_text_file(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn get_rss_kb() -> usize {
+    fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+        .map(|pages| pages * 4) // page size = 4 KiB
+        .unwrap_or(0)
+}
+
 fn run_profile() -> io::Result<()> {
     let files = Arc::new(Mutex::new(Vec::new()));
     let loading = Arc::new(Mutex::new(true));
@@ -1170,6 +1166,102 @@ fn run_profile() -> io::Result<()> {
                 let cache_time = start.elapsed();
                 eprintln!("profile: hot cache access {:?} in {:?}", first.name, cache_time);
             }
+        }
+    }
+
+    // Profile video loading
+    eprintln!("\n=== Video Loading Profile ===");
+    let video_files: Vec<_> = files.iter()
+        .filter(|f| is_video_file(&f.path))
+        .take(3)
+        .collect();
+
+    if video_files.is_empty() {
+        eprintln!("No video files found in recent files");
+    } else {
+        for file in &video_files {
+            eprintln!("\n--- {} ---", file.name);
+
+            // Get video info
+            if let Some(dur) = get_video_duration(&file.path) {
+                eprintln!("  duration: {:.1}s", dur);
+            }
+            if let Some((w, h)) = get_video_dimensions(&file.path) {
+                let (sw, sh) = compute_scaled_dimensions(w, h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+                eprintln!("  source: {}x{} -> scaled: {}x{}", w, h, sw, sh);
+                let frame_bytes = sw as usize * sh as usize * 3;
+                eprintln!("  raw frame size: {} bytes ({:.1} KiB)", frame_bytes, frame_bytes as f64 / 1024.0);
+            }
+
+            // Measure RSS before
+            let rss_before = get_rss_kb();
+
+            let shared = Arc::new(Mutex::new(Vec::new()));
+            let shared_clone = Arc::clone(&shared);
+            let path = file.path.clone();
+
+            let start = Instant::now();
+            let handle = thread::spawn(move || {
+                stream_video_frames(&path, shared_clone);
+            });
+
+            // Poll for first frame
+            let first_frame_time;
+            loop {
+                if !shared.lock().unwrap().is_empty() {
+                    first_frame_time = start.elapsed();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+                if start.elapsed() > Duration::from_secs(30) {
+                    eprintln!("  TIMEOUT waiting for first frame");
+                    first_frame_time = start.elapsed();
+                    break;
+                }
+            }
+            eprintln!("  first frame: {:?}", first_frame_time);
+
+            handle.join().unwrap();
+            let total_time = start.elapsed();
+
+            let frames = shared.lock().unwrap();
+            let frame_count = frames.len();
+            let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
+            let avg_frame = if frame_count > 0 { total_bytes / frame_count } else { 0 };
+
+            // Measure RSS after
+            let rss_after = get_rss_kb();
+
+            eprintln!("  total: {:?} ({} frames)", total_time, frame_count);
+            if frame_count > 0 {
+                let fps = frame_count as f64 / total_time.as_secs_f64();
+                eprintln!("  extraction rate: {:.1} frames/sec", fps);
+                eprintln!("  frame data: {:.1} KiB avg, {:.1} MiB total",
+                    avg_frame as f64 / 1024.0,
+                    total_bytes as f64 / (1024.0 * 1024.0));
+            }
+            eprintln!("  RSS: {} KiB -> {} KiB (delta: {} KiB)",
+                rss_before, rss_after, rss_after.saturating_sub(rss_before));
+        }
+
+        // Profile video cache hit
+        eprintln!("\n=== Video Cache ===");
+        let mut vcache = VideoCache::new(VIDEO_CACHE_SIZE);
+        if let Some(first) = video_files.first() {
+            let shared = Arc::new(Mutex::new(Vec::new()));
+            let shared_clone = Arc::clone(&shared);
+            let path = first.path.clone();
+            let start = Instant::now();
+            stream_video_frames(&path, shared_clone);
+            let cold = start.elapsed();
+            let frames = Arc::try_unwrap(shared).unwrap().into_inner().unwrap();
+            let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
+            vcache.insert(first.path.clone(), frames);
+            eprintln!("  cold load {:?}: {:?} ({:.1} MiB)", first.name, cold, total_bytes as f64 / (1024.0 * 1024.0));
+
+            let start = Instant::now();
+            let _ = vcache.get(&first.path);
+            eprintln!("  hot cache access {:?}: {:?}", first.name, start.elapsed());
         }
     }
 
