@@ -38,30 +38,32 @@ const THUMBNAIL_MAX_WIDTH: u32 = 800;
 const THUMBNAIL_MAX_HEIGHT: u32 = 600;
 const VIDEO_PREVIEW_FRAMES: usize = 75;
 const VIDEO_FRAME_INTERVAL_MS: u64 = 66;
+const VIDEO_CACHE_SIZE: usize = 5;
 
 #[derive(Clone)]
 struct CachedImage {
-    data: Vec<u8>,  // PNG-encoded thumbnail
+    data: Vec<u8>,  // JPEG or PNG-encoded thumbnail
     width: u32,
     height: u32,
 }
 
-struct ImageCache {
-    cache: HashMap<String, CachedImage>,
-    order: Vec<String>,  // LRU order
+struct LruCache<T> {
+    cache: HashMap<String, T>,
+    order: Vec<String>,
+    capacity: usize,
 }
 
-impl ImageCache {
-    fn new() -> Self {
+impl<T> LruCache<T> {
+    fn new(capacity: usize) -> Self {
         Self {
             cache: HashMap::new(),
             order: Vec::new(),
+            capacity,
         }
     }
 
-    fn get(&mut self, path: &str) -> Option<&CachedImage> {
+    fn get(&mut self, path: &str) -> Option<&T> {
         if self.cache.contains_key(path) {
-            // Move to end (most recently used)
             self.order.retain(|p| p != path);
             self.order.push(path.to_string());
             self.cache.get(path)
@@ -70,18 +72,20 @@ impl ImageCache {
         }
     }
 
-    fn insert(&mut self, path: String, image: CachedImage) {
-        // Evict oldest if at capacity
-        while self.order.len() >= IMAGE_CACHE_SIZE {
+    fn insert(&mut self, path: String, value: T) {
+        while self.order.len() >= self.capacity {
             if let Some(old) = self.order.first().cloned() {
                 self.cache.remove(&old);
                 self.order.remove(0);
             }
         }
         self.order.push(path.clone());
-        self.cache.insert(path, image);
+        self.cache.insert(path, value);
     }
 }
+
+type ImageCache = LruCache<CachedImage>;
+type VideoCache = LruCache<Vec<CachedImage>>;
 
 struct FileEntry {
     path: String,
@@ -101,6 +105,7 @@ enum PreviewContent {
     Text(Vec<Line<'static>>),
     Image(CachedImage),
     Video(Vec<CachedImage>),
+    VideoStreaming(Vec<CachedImage>),
     VideoLoading,
     None,
 }
@@ -118,9 +123,11 @@ struct App {
     preview_path: String,
     preview_content: PreviewContent,
     image_cache: ImageCache,
+    video_cache: VideoCache,
     video_frame: usize,
     video_frame_time: Instant,
-    video_loader: Option<Arc<Mutex<Option<Vec<CachedImage>>>>>,
+    video_loader: Option<Arc<Mutex<Vec<CachedImage>>>>,
+    video_loader_done: Option<Arc<Mutex<bool>>>,
     video_loader_path: String,
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
@@ -154,10 +161,12 @@ impl App {
             last_file_count: 0,
             preview_path: String::new(),
             preview_content: PreviewContent::None,
-            image_cache: ImageCache::new(),
+            image_cache: LruCache::new(IMAGE_CACHE_SIZE),
+            video_cache: LruCache::new(VIDEO_CACHE_SIZE),
             video_frame: 0,
             video_frame_time: Instant::now(),
             video_loader: None,
+            video_loader_done: None,
             video_loader_path: String::new(),
             syntax_set,
             theme,
@@ -167,17 +176,29 @@ impl App {
     fn update_preview(&mut self) {
         let current_path = self.selected_file().unwrap_or_default();
         if current_path == self.preview_path {
-            // Check if async video loader finished
-            let loaded_frames = self.video_loader.as_ref().and_then(|loader| {
-                loader.lock().unwrap().take()
-            });
-            if let Some(frames) = loaded_frames {
-                self.video_loader = None;
+            // Check if streaming video has new frames
+            if let Some(ref loader) = self.video_loader {
+                let frames = loader.lock().unwrap();
+                let done = self.video_loader_done.as_ref()
+                    .map(|d| *d.lock().unwrap()).unwrap_or(false);
                 if !frames.is_empty() {
-                    self.video_frame = 0;
-                    self.video_frame_time = Instant::now();
-                    self.preview_content = PreviewContent::Video(frames);
-                } else {
+                    let new_frames = frames.clone();
+                    drop(frames);
+                    if done {
+                        self.video_cache.insert(current_path.clone(), new_frames.clone());
+                        self.video_loader = None;
+                        self.video_loader_done = None;
+                        self.preview_content = PreviewContent::Video(new_frames);
+                    } else {
+                        self.preview_content = PreviewContent::VideoStreaming(new_frames);
+                        if self.video_frame == 0 {
+                            self.video_frame_time = Instant::now();
+                        }
+                    }
+                } else if done {
+                    drop(frames);
+                    self.video_loader = None;
+                    self.video_loader_done = None;
                     self.preview_content = PreviewContent::Text(vec![
                         Line::from(Span::styled("[Cannot load video]", Style::default().fg(Color::DarkGray)))
                     ]);
@@ -190,6 +211,7 @@ impl App {
         // Cancel any in-flight video loader for a different path
         if self.video_loader_path != current_path {
             self.video_loader = None;
+            self.video_loader_done = None;
             self.video_loader_path.clear();
         }
 
@@ -199,15 +221,26 @@ impl App {
         }
 
         if is_video_file(&current_path) {
-            let result = Arc::new(Mutex::new(None));
-            let result_clone = Arc::clone(&result);
+            // Check video cache first
+            if let Some(cached_frames) = self.video_cache.get(&current_path) {
+                self.video_frame = 0;
+                self.video_frame_time = Instant::now();
+                self.preview_content = PreviewContent::Video(cached_frames.clone());
+                return;
+            }
+            let shared_frames = Arc::new(Mutex::new(Vec::new()));
+            let shared_done = Arc::new(Mutex::new(false));
+            let frames_clone = Arc::clone(&shared_frames);
+            let done_clone = Arc::clone(&shared_done);
             let path = current_path.clone();
             thread::spawn(move || {
-                let frames = load_video_frames(&path).unwrap_or_default();
-                *result_clone.lock().unwrap() = Some(frames);
+                stream_video_frames(&path, frames_clone);
+                *done_clone.lock().unwrap() = true;
             });
-            self.video_loader = Some(result);
+            self.video_loader = Some(shared_frames);
+            self.video_loader_done = Some(shared_done);
             self.video_loader_path = current_path.clone();
+            self.video_frame = 0;
             self.preview_content = PreviewContent::VideoLoading;
         } else if is_image_file(&current_path) {
             // Check cache first
@@ -464,58 +497,126 @@ fn get_video_duration(path: &str) -> Option<f64> {
     s.trim().parse::<f64>().ok()
 }
 
-fn load_video_frames(path: &str) -> Option<Vec<CachedImage>> {
+fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2;
+    while i + 4 < data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let marker = data[i + 1];
+        if marker == 0xD9 {
+            return None;
+        }
+        if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
+            if i + 9 < data.len() {
+                let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+                let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
+                return Some((w, h));
+            }
+        }
+        if i + 3 < data.len() {
+            let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+            i += 2 + len;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
     let duration = get_video_duration(path).unwrap_or(5.0);
-    // Spread frames evenly across the whole video
     let fps = (VIDEO_PREVIEW_FRAMES as f64 / duration).max(0.5);
     let scale_filter = format!(
         "fps={:.4},scale={}:{}:force_original_aspect_ratio=decrease",
         fps, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT
     );
-    let output = Command::new("ffmpeg")
+    let mut child = match Command::new("ffmpeg")
         .args([
             "-i", path,
             "-vf", &scale_filter,
             "-frames:v", &VIDEO_PREVIEW_FRAMES.to_string(),
             "-f", "image2pipe",
-            "-vcodec", "png",
+            "-vcodec", "mjpeg",
+            "-q:v", "5",
             "-",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .spawn() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
 
-    if !output.status.success() || output.stdout.is_empty() {
-        return None;
-    }
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return,
+    };
 
-    // Split concatenated PNG stream by PNG magic bytes
-    let png_magic: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    let data = &output.stdout;
-    let mut frames = Vec::new();
-    let mut start = 0;
+    let mut reader = BufReader::with_capacity(256 * 1024, stdout);
+    let mut buf = Vec::with_capacity(512 * 1024);
+    let mut frame_count = 0;
 
-    for i in 1..data.len().saturating_sub(7) {
-        if data[i..i + 8] == png_magic {
-            let frame_data = data[start..i].to_vec();
-            if let Ok(img) = image::load_from_memory(&frame_data) {
-                let (w, h) = img.dimensions();
-                frames.push(CachedImage { data: frame_data, width: w, height: h });
+    loop {
+        let mut tmp = [0u8; 32768];
+        let n = match io::Read::read(&mut reader, &mut tmp) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&tmp[..n]);
+
+        // Split on JPEG SOI markers (0xFF 0xD8)
+        loop {
+            if buf.len() < 4 {
+                break;
             }
-            start = i;
-        }
-    }
-    // Last frame
-    if start < data.len() {
-        let frame_data = data[start..].to_vec();
-        if let Ok(img) = image::load_from_memory(&frame_data) {
-            let (w, h) = img.dimensions();
-            frames.push(CachedImage { data: frame_data, width: w, height: h });
+            // Find next SOI after position 2 (skip the first SOI of current frame)
+            let mut split_at = None;
+            for i in 2..buf.len().saturating_sub(1) {
+                if buf[i] == 0xFF && buf[i + 1] == 0xD8 {
+                    split_at = Some(i);
+                    break;
+                }
+            }
+            match split_at {
+                Some(pos) => {
+                    let frame_data: Vec<u8> = buf.drain(..pos).collect();
+                    if frame_data.len() > 2 {
+                        let (w, h) = jpeg_dimensions(&frame_data).unwrap_or((0, 0));
+                        if w > 0 && h > 0 {
+                            shared.lock().unwrap().push(CachedImage {
+                                data: frame_data,
+                                width: w,
+                                height: h,
+                            });
+                            frame_count += 1;
+                            if frame_count >= VIDEO_PREVIEW_FRAMES {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return;
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
         }
     }
 
-    if frames.is_empty() { None } else { Some(frames) }
+    // Flush last frame
+    if buf.len() > 2 {
+        let (w, h) = jpeg_dimensions(&buf).unwrap_or((0, 0));
+        if w > 0 && h > 0 {
+            shared.lock().unwrap().push(CachedImage {
+                data: buf,
+                width: w,
+                height: h,
+            });
+        }
+    }
+
+    let _ = child.wait();
 }
 
 fn time_ago(mtime: SystemTime) -> String {
@@ -1053,7 +1154,7 @@ fn run_profile() -> io::Result<()> {
 
         // Profile cached access
         eprintln!("\n=== Cached Image Access ===");
-        let mut cache = ImageCache::new();
+        let mut cache = ImageCache::new(IMAGE_CACHE_SIZE);
 
         // First load (cold)
         if let Some(first) = image_files.first() {
@@ -1267,6 +1368,19 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
             ))],
             true,
         ),
+        PreviewContent::VideoStreaming(frames) => {
+            if frames.is_empty() {
+                (vec![Line::from(Span::styled(
+                    "Loading video...",
+                    Style::default().fg(Color::Yellow),
+                ))], false)
+            } else {
+                (vec![Line::from(Span::styled(
+                    format!(" {}/{} (loading...)", app.video_frame + 1, frames.len()),
+                    Style::default().fg(Color::Yellow),
+                ))], true)
+            }
+        }
         PreviewContent::VideoLoading => (
             vec![Line::from(Span::styled(
                 "Loading video...",
@@ -1283,7 +1397,7 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         ),
     };
     let preview_title = match &app.preview_content {
-        PreviewContent::Video(_) | PreviewContent::VideoLoading => " Video ",
+        PreviewContent::Video(_) | PreviewContent::VideoStreaming(_) | PreviewContent::VideoLoading => " Video ",
         PreviewContent::Image(_) => " Image ",
         _ => " Preview ",
     };
@@ -1508,23 +1622,26 @@ fn main() -> io::Result<()> {
                     }
                     last_image_area = Some(area);
                 }
-                PreviewContent::Video(ref frames) => {
-                    // Advance frame on timer
-                    if app.video_frame_time.elapsed()
-                        >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS)
-                    {
-                        app.video_frame = (app.video_frame + 1) % frames.len();
-                        app.video_frame_time = Instant::now();
-                    }
-                    // Only re-render if frame changed
-                    if app.video_frame != last_video_frame
-                        || app.preview_path != last_rendered_path
-                    {
-                        if let Some(frame) = frames.get(app.video_frame) {
-                            let _ = render_kitty_image(frame, inner);
+                PreviewContent::Video(ref frames) | PreviewContent::VideoStreaming(ref frames) => {
+                    if !frames.is_empty() {
+                        if app.video_frame_time.elapsed()
+                            >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS)
+                        {
+                            app.video_frame = (app.video_frame + 1) % frames.len();
+                            app.video_frame_time = Instant::now();
                         }
-                        last_video_frame = app.video_frame;
-                        last_rendered_path = app.preview_path.clone();
+                        if app.video_frame >= frames.len() {
+                            app.video_frame = 0;
+                        }
+                        if app.video_frame != last_video_frame
+                            || app.preview_path != last_rendered_path
+                        {
+                            if let Some(frame) = frames.get(app.video_frame) {
+                                let _ = render_kitty_image(frame, inner);
+                            }
+                            last_video_frame = app.video_frame;
+                            last_rendered_path = app.preview_path.clone();
+                        }
                     }
                     last_image_area = Some(area);
                 }
@@ -1540,7 +1657,8 @@ fn main() -> io::Result<()> {
         // Poll with shorter timeout for smooth video, longer for static content
         let poll_ms = match &app.preview_content {
             PreviewContent::Video(_) => 16, // ~60fps
-            PreviewContent::VideoLoading => 50, // check for loaded frames frequently
+            PreviewContent::VideoStreaming(_) => 16,
+            PreviewContent::VideoLoading => 50,
             _ => 100,
         };
         if event::poll(Duration::from_millis(poll_ms))? {
