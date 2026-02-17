@@ -45,6 +45,7 @@ struct CachedImage {
     data: Vec<u8>,
     width: u32,
     height: u32,
+    is_raw_rgb: bool,
 }
 
 struct LruCache<T> {
@@ -528,15 +529,7 @@ fn compute_scaled_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> 
     (w.max(2), h.max(2))
 }
 
-fn encode_rgb_to_jpeg(rgb_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    let img = image::RgbImage::from_raw(width, height, rgb_data.to_vec())?;
-    let mut jpeg_buf = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut jpeg_buf);
-    image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut cursor, image::ImageFormat::Jpeg)
-        .ok()?;
-    Some(jpeg_buf)
-}
+
 
 fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
     let duration = get_video_duration(path).unwrap_or(5.0);
@@ -549,6 +542,7 @@ fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
         "fps={:.4},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2",
         fps, out_w, out_h, out_w, out_h
     );
+
     let mut child = match Command::new("ffmpeg")
         .args([
             "-i", path,
@@ -585,13 +579,12 @@ fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
 
         while buf.len() >= frame_size {
             let raw_frame: Vec<u8> = buf.drain(..frame_size).collect();
-            if let Some(jpeg_data) = encode_rgb_to_jpeg(&raw_frame, out_w, out_h) {
-                shared.lock().unwrap().push(CachedImage {
-                    data: jpeg_data,
-                    width: out_w,
-                    height: out_h,
-                });
-            }
+            shared.lock().unwrap().push(CachedImage {
+                data: raw_frame,
+                width: out_w,
+                height: out_h,
+                is_raw_rgb: true,
+            });
             frame_count += 1;
             if frame_count >= VIDEO_PREVIEW_FRAMES {
                 let _ = child.kill();
@@ -694,6 +687,7 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
         data: png_data,
         width: new_w,
         height: new_h,
+        is_raw_rgb: false,
     })
 }
 
@@ -748,14 +742,26 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
     for (i, chunk) in chunks.iter().enumerate() {
         let is_last = i == chunks.len() - 1;
         if i == 0 {
-            write!(
-                stdout,
-                "\x1b_Ga=T,f=100,c={},r={},m={};{}\x1b\\",
-                cols,
-                rows,
-                if is_last { 0 } else { 1 },
-                chunk
-            )?;
+            if img.is_raw_rgb {
+                write!(
+                    stdout,
+                    "\x1b_Ga=T,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
+                    img.width, img.height,
+                    cols,
+                    rows,
+                    if is_last { 0 } else { 1 },
+                    chunk
+                )?;
+            } else {
+                write!(
+                    stdout,
+                    "\x1b_Ga=T,f=100,c={},r={},m={};{}\x1b\\",
+                    cols,
+                    rows,
+                    if is_last { 0 } else { 1 },
+                    chunk
+                )?;
+            }
         } else {
             write!(
                 stdout,
