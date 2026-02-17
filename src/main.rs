@@ -130,6 +130,7 @@ struct App {
     video_loader: Option<Arc<Mutex<Vec<CachedImage>>>>,
     video_loader_done: Option<Arc<Mutex<bool>>>,
     video_loader_path: String,
+    video_cache_pending: Arc<Mutex<Option<(String, Vec<CachedImage>)>>>,
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
 }
@@ -169,12 +170,18 @@ impl App {
             video_loader: None,
             video_loader_done: None,
             video_loader_path: String::new(),
+            video_cache_pending: Arc::new(Mutex::new(None)),
             syntax_set,
             theme,
         }
     }
 
     fn update_preview(&mut self) {
+        // Drain any pending PNG-compressed frames into the cache
+        if let Some((path, frames)) = self.video_cache_pending.lock().unwrap().take() {
+            self.video_cache.insert(path, frames);
+        }
+
         let current_path = self.selected_file().unwrap_or_default();
         if current_path == self.preview_path {
             // Check if streaming video has new frames
@@ -186,7 +193,24 @@ impl App {
                     let new_frames = frames.clone();
                     drop(frames);
                     if done {
-                        self.video_cache.insert(current_path.clone(), new_frames.clone());
+                        let cache_path = current_path.clone();
+                        let frames_for_cache = new_frames.clone();
+                        let cache = Arc::clone(&self.video_cache_pending);
+                        thread::spawn(move || {
+                            let png_frames: Vec<CachedImage> = frames_for_cache.iter().filter_map(|f| {
+                                if f.is_raw_rgb {
+                                    let img = image::RgbImage::from_raw(f.width, f.height, f.data.clone())?;
+                                    let mut buf = Vec::new();
+                                    let mut cursor = std::io::Cursor::new(&mut buf);
+                                    image::DynamicImage::ImageRgb8(img)
+                                        .write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+                                    Some(CachedImage { data: buf, width: f.width, height: f.height, is_raw_rgb: false })
+                                } else {
+                                    Some(f.clone())
+                                }
+                            }).collect();
+                            cache.lock().unwrap().replace((cache_path, png_frames));
+                        });
                         self.video_loader = None;
                         self.video_loader_done = None;
                         self.preview_content = PreviewContent::Video(new_frames);
@@ -1936,13 +1960,17 @@ fn main() -> io::Result<()> {
                     (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
                         if app.active_column != 0 {
                             app.active_column = 0;
-                            app.selected = 0;
+                            if app.selected >= app.matches.len() {
+                                app.selected = app.matches.len().saturating_sub(1);
+                            }
                         }
                     }
                     (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                         if app.active_column != 1 {
                             app.active_column = 1;
-                            app.selected = 0;
+                            if app.selected >= app.matches_by_time.len() {
+                                app.selected = app.matches_by_time.len().saturating_sub(1);
+                            }
                         }
                     }
                     (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
