@@ -191,9 +191,6 @@ impl App {
                         self.preview_content = PreviewContent::Video(new_frames);
                     } else {
                         self.preview_content = PreviewContent::VideoStreaming(new_frames);
-                        if self.video_frame == 0 {
-                            self.video_frame_time = Instant::now();
-                        }
                     }
                 } else if done {
                     drop(frames);
@@ -1668,10 +1665,152 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
     }
 }
 
+fn run_test_video() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let path = args.get(2).map(|s| s.as_str()).unwrap_or("/home/jeremy/recording.mp4");
+    
+    eprintln!("=== Video Pipeline Test: {} ===\n", path);
+    
+    // Step 1: ffprobe duration
+    let start = Instant::now();
+    let dur = get_video_duration(path);
+    eprintln!("[{:?}] duration: {:?}", start.elapsed(), dur);
+    
+    // Step 2: ffprobe dimensions
+    let start2 = Instant::now();
+    let dims = get_video_dimensions(path);
+    eprintln!("[{:?}] dimensions: {:?}", start2.elapsed(), dims);
+    
+    let (src_w, src_h) = dims.unwrap_or((640, 480));
+    let (out_w, out_h) = compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+    let frame_size = (out_w * out_h * 3) as usize;
+    eprintln!("  scaled: {}x{}, raw frame: {} bytes\n", out_w, out_h, frame_size);
+    
+    // Step 3: Stream frames (same as runtime)
+    let shared = Arc::new(Mutex::new(Vec::new()));
+    let shared_clone = Arc::clone(&shared);
+    let done = Arc::new(Mutex::new(false));
+    let done_clone = Arc::clone(&done);
+    let path_owned = path.to_string();
+    
+    let stream_start = Instant::now();
+    thread::spawn(move || {
+        stream_video_frames(&path_owned, shared_clone);
+        *done_clone.lock().unwrap() = true;
+    });
+    
+    // Simulate the UI polling loop
+    let mut last_count = 0;
+    let mut first_frame_at = None;
+    let mut state_transitions = Vec::new();
+    
+    loop {
+        let frames = shared.lock().unwrap();
+        let count = frames.len();
+        let is_done = *done.lock().unwrap();
+        
+        if count != last_count {
+            if first_frame_at.is_none() {
+                first_frame_at = Some(stream_start.elapsed());
+                state_transitions.push(format!("[{:?}] VideoLoading -> VideoStreaming (1 frame, {} bytes)", 
+                    stream_start.elapsed(), frames[0].data.len()));
+            }
+            if count % 10 == 0 || is_done {
+                eprintln!("[{:?}] {} frames (latest: {} bytes)", 
+                    stream_start.elapsed(), count, frames.last().map(|f| f.data.len()).unwrap_or(0));
+            }
+            last_count = count;
+        }
+        drop(frames);
+        
+        if is_done {
+            state_transitions.push(format!("[{:?}] VideoStreaming -> Video ({} frames)", 
+                stream_start.elapsed(), last_count));
+            break;
+        }
+        
+        thread::sleep(Duration::from_millis(16));
+    }
+    
+    eprintln!("\n=== Results ===");
+    for t in &state_transitions {
+        eprintln!("  {}", t);
+    }
+    
+    let frames = shared.lock().unwrap();
+    let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
+    eprintln!("\n  frames: {}", frames.len());
+    eprintln!("  first frame latency: {:?}", first_frame_at.unwrap_or_default());
+    eprintln!("  total time: {:?}", stream_start.elapsed());
+    eprintln!("  memory: {:.1} MiB ({:.1} KiB avg/frame)", 
+        total_bytes as f64 / (1024.0 * 1024.0),
+        total_bytes as f64 / (frames.len().max(1) as f64 * 1024.0));
+    
+    // Flicker test: check if any frames have zero or suspiciously small sizes
+    let mut bad_frames = 0;
+    for (i, f) in frames.iter().enumerate() {
+        if f.data.len() < 100 || f.width == 0 || f.height == 0 {
+            eprintln!("  WARNING: frame {} looks bad: {} bytes, {}x{}", i, f.data.len(), f.width, f.height);
+            bad_frames += 1;
+        }
+    }
+    if bad_frames == 0 {
+        eprintln!("  all frames valid ✓");
+    }
+    
+    // Check for duplicate/identical frames (could cause visual stutter)
+    let mut dupes = 0;
+    for i in 1..frames.len() {
+        if frames[i].data == frames[i-1].data {
+            dupes += 1;
+        }
+    }
+    if dupes > 0 {
+        eprintln!("  {} consecutive duplicate frames detected", dupes);
+    } else {
+        eprintln!("  no duplicate frames ✓");
+    }
+    
+    // Flicker test: simulate the render loop and check if frame index stays valid
+    eprintln!("\n=== Flicker Simulation ===");
+    let frame_count = frames.len();
+    drop(frames);
+    
+    let mut video_frame = 0usize;
+    let mut video_frame_time = Instant::now();
+    let mut render_count = 0;
+    let mut out_of_bounds = 0;
+    let sim_start = Instant::now();
+    
+    // Simulate 5 seconds of playback
+    while sim_start.elapsed() < Duration::from_secs(5) {
+        if video_frame_time.elapsed() >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS) {
+            video_frame = (video_frame + 1) % frame_count;
+            video_frame_time = Instant::now();
+        }
+        if video_frame >= frame_count {
+            out_of_bounds += 1;
+            video_frame = 0;
+        }
+        render_count += 1;
+        thread::sleep(Duration::from_millis(16));
+    }
+    
+    eprintln!("  {} render cycles, {} out-of-bounds corrections", render_count, out_of_bounds);
+    if out_of_bounds == 0 {
+        eprintln!("  frame indexing OK ✓");
+    }
+    
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--profile") {
         return run_profile();
+    }
+    if args.iter().any(|arg| arg == "--test-video") {
+        return run_test_video();
     }
 
     // Setup terminal
