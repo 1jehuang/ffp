@@ -715,47 +715,39 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
     })
 }
 
-/// Render image using kitty graphics protocol
-fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
-    let mut stdout = io::stdout();
-
-    // Save cursor position, delete previous image
-    write!(stdout, "\x1b7\x1b_Ga=d,d=a\x1b\\")?;
+/// Render image using kitty graphics protocol to the given writer
+fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) -> io::Result<()> {
+    // Hide cursor to prevent flicker during repositioning
+    write!(out, "\x1b[?25l")?;
 
     // Calculate display cells that preserve aspect ratio.
-    // Terminal cells are ~2x taller than wide, so we correct for that.
-    let cell_ratio = 2.0_f64; // cell_height / cell_width in pixels
+    let cell_ratio = 2.0_f64;
     let img_ratio = (img.width as f64 / img.height as f64) * cell_ratio;
     let area_ratio = area.width as f64 / area.height as f64;
 
     let (cols, rows) = if img_ratio > area_ratio {
-        // Image is wider than area — fit to width
         let c = area.width as u32;
         let r = ((c as f64) / img_ratio).max(1.0) as u32;
         (c, r.min(area.height as u32))
     } else {
-        // Image is taller than area — fit to height
         let r = area.height as u32;
         let c = ((r as f64) * img_ratio).max(1.0) as u32;
         (c.min(area.width as u32), r)
     };
 
-    // Center the image in the available area
     let offset_x = (area.width as u32).saturating_sub(cols) / 2;
     let offset_y = (area.height as u32).saturating_sub(rows) / 2;
 
-    // Move cursor to centered position (1-indexed)
     write!(
-        stdout,
+        out,
         "\x1b[{};{}H",
         area.y as u32 + 1 + offset_y,
         area.x as u32 + 1 + offset_x
     )?;
 
-    // Encode image data as base64
     let b64_data = BASE64.encode(&img.data);
 
-    // Send image in chunks (kitty protocol limit is 4096 bytes per chunk)
+    // Use i=1 to replace the previous image atomically (no clear/redraw flicker)
     let chunk_size = 4096;
     let chunks: Vec<&str> = b64_data
         .as_bytes()
@@ -768,8 +760,8 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
         if i == 0 {
             if img.is_raw_rgb {
                 write!(
-                    stdout,
-                    "\x1b_Ga=T,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
+                    out,
+                    "\x1b_Ga=T,q=2,i=1,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
                     img.width, img.height,
                     cols,
                     rows,
@@ -778,8 +770,8 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
                 )?;
             } else {
                 write!(
-                    stdout,
-                    "\x1b_Ga=T,f=100,c={},r={},m={};{}\x1b\\",
+                    out,
+                    "\x1b_Ga=T,q=2,i=1,f=100,c={},r={},m={};{}\x1b\\",
                     cols,
                     rows,
                     if is_last { 0 } else { 1 },
@@ -788,7 +780,7 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
             }
         } else {
             write!(
-                stdout,
+                out,
                 "\x1b_Gm={};{}\x1b\\",
                 if is_last { 0 } else { 1 },
                 chunk
@@ -796,18 +788,27 @@ fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
         }
     }
 
-    // Restore cursor position
-    write!(stdout, "\x1b8")?;
-    stdout.flush()?;
+    // Show cursor again
+    write!(out, "\x1b[?25h")?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Render image using kitty graphics protocol
+fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
+    render_kitty_image_to(img, area, &mut io::stdout())
+}
+
+/// Clear any kitty graphics
+fn clear_kitty_image_to(out: &mut impl Write) -> io::Result<()> {
+    write!(out, "\x1b_Ga=d,d=I,i=1,q=2\x1b\\")?;
+    out.flush()?;
     Ok(())
 }
 
 /// Clear any kitty graphics at the given area
 fn clear_kitty_image() -> io::Result<()> {
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b_Ga=d,d=a\x1b\\")?;
-    stdout.flush()?;
-    Ok(())
+    clear_kitty_image_to(&mut io::stdout())
 }
 
 fn get_icon(filename: &str) -> (&'static str, Color) {
@@ -1329,6 +1330,210 @@ mod tests {
         let matches = fuzzy_match("résumé", &files, 10);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].index, 0);
+    }
+
+    fn parse_kitty_commands(data: &str) -> Vec<String> {
+        let mut cmds = Vec::new();
+        let mut i = 0;
+        let bytes = data.as_bytes();
+        while i < bytes.len() {
+            if i + 1 < bytes.len() && bytes[i] == 0x1b && bytes[i + 1] == b'_' {
+                let start = i;
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        cmds.push(data[start..i + 2].to_string());
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        cmds
+    }
+
+    fn get_kitty_header(cmd: &str) -> &str {
+        let inner = &cmd[2..cmd.len() - 2]; // strip \x1b_ and \x1b\ 
+        if let Some(pos) = inner.find(';') {
+            &inner[..pos]
+        } else {
+            inner
+        }
+    }
+
+    #[test]
+    fn kitty_png_image_has_correct_format() {
+        let img = CachedImage {
+            data: vec![0u8; 100],
+            width: 200,
+            height: 100,
+            is_raw_rgb: false,
+        };
+        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let mut buf = Vec::new();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let cmds = parse_kitty_commands(&output);
+        assert!(!cmds.is_empty(), "should emit at least one kitty command");
+
+        let header = get_kitty_header(&cmds[0]);
+        assert!(header.contains("a=T"), "action should be transmit+display");
+        assert!(header.contains("q=2"), "must have quiet mode to suppress responses");
+        assert!(header.contains("i=1"), "must use image ID 1 for atomic replacement");
+        assert!(header.contains("f=100"), "PNG data must use f=100");
+        assert!(!header.contains("f=24"), "PNG data must not use f=24");
+    }
+
+    #[test]
+    fn kitty_raw_rgb_has_correct_format() {
+        let w = 160u32;
+        let h = 90u32;
+        let img = CachedImage {
+            data: vec![0u8; (w * h * 3) as usize],
+            width: w,
+            height: h,
+            is_raw_rgb: true,
+        };
+        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let mut buf = Vec::new();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let cmds = parse_kitty_commands(&output);
+        assert!(!cmds.is_empty());
+
+        let header = get_kitty_header(&cmds[0]);
+        assert!(header.contains("f=24"), "raw RGB must use f=24");
+        assert!(header.contains(&format!("s={}", w)), "must specify pixel width");
+        assert!(header.contains(&format!("v={}", h)), "must specify pixel height");
+        assert!(header.contains("q=2"), "must have quiet mode");
+        assert!(header.contains("i=1"), "must use image ID 1");
+    }
+
+    #[test]
+    fn kitty_multi_chunk_has_correct_continuation() {
+        let img = CachedImage {
+            data: vec![0xFFu8; 8192],
+            width: 50,
+            height: 50,
+            is_raw_rgb: false,
+        };
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let mut buf = Vec::new();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let cmds = parse_kitty_commands(&output);
+        assert!(cmds.len() >= 2, "8KB data should produce multiple chunks, got {}", cmds.len());
+
+        let first_header = get_kitty_header(&cmds[0]);
+        assert!(first_header.contains("m=1"), "first chunk must signal more data (m=1)");
+
+        for cmd in &cmds[1..cmds.len() - 1] {
+            let h = get_kitty_header(cmd);
+            assert!(h.contains("m=1"), "middle chunk must have m=1");
+            assert!(!h.contains("a="), "continuation chunks should not have action key");
+        }
+
+        let last_header = get_kitty_header(cmds.last().unwrap());
+        assert!(last_header.contains("m=0"), "last chunk must signal end (m=0)");
+    }
+
+    #[test]
+    fn kitty_cursor_hidden_during_render() {
+        let img = CachedImage {
+            data: vec![0u8; 10],
+            width: 10,
+            height: 10,
+            is_raw_rgb: false,
+        };
+        let area = Rect { x: 5, y: 5, width: 20, height: 10 };
+        let mut buf = Vec::new();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let hide_pos = output.find("\x1b[?25l").expect("should hide cursor");
+        let show_pos = output.rfind("\x1b[?25h").expect("should show cursor");
+        let first_kitty = output.find("\x1b_G").expect("should have kitty command");
+
+        assert!(hide_pos < first_kitty, "cursor hide must come before kitty data");
+        assert!(show_pos > first_kitty, "cursor show must come after kitty data");
+    }
+
+    #[test]
+    fn kitty_clear_uses_id_and_quiet() {
+        let mut buf = Vec::new();
+        clear_kitty_image_to(&mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        assert!(output.contains("a=d"), "clear must use delete action");
+        assert!(output.contains("d=I"), "must delete by image ID");
+        assert!(output.contains("i=1"), "must target image ID 1");
+        assert!(output.contains("q=2"), "must use quiet mode");
+        assert!(!output.contains("d=a"), "must NOT delete all images");
+    }
+
+    #[test]
+    fn kitty_no_response_triggers() {
+        let img = CachedImage {
+            data: vec![0u8; 100],
+            width: 50,
+            height: 50,
+            is_raw_rgb: false,
+        };
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let mut buf = Vec::new();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let cmds = parse_kitty_commands(&output);
+        for cmd in &cmds {
+            let header = get_kitty_header(cmd);
+            if header.contains("a=") {
+                assert!(header.contains("q=2"),
+                    "every command with an action must have q=2 to prevent stdin spam: {}", header);
+            }
+        }
+    }
+
+    #[test]
+    fn kitty_aspect_ratio_preserved() {
+        let img = CachedImage {
+            data: vec![0u8; 10],
+            width: 1920,
+            height: 1080,
+            is_raw_rgb: false,
+        };
+        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let mut buf = Vec::new();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let cmds = parse_kitty_commands(&output);
+        let header = get_kitty_header(&cmds[0]);
+
+        let c_val: u32 = header.split(',')
+            .find(|s| s.starts_with("c="))
+            .and_then(|s| s[2..].parse().ok())
+            .expect("must have c= columns");
+        let r_val: u32 = header.split(',')
+            .find(|s| s.starts_with("r="))
+            .and_then(|s| s[2..].parse().ok())
+            .expect("must have r= rows");
+
+        assert!(c_val <= 80, "cols {} must fit in area width 80", c_val);
+        assert!(r_val <= 40, "rows {} must fit in area height 40", r_val);
+        assert!(c_val > 0 && r_val > 0, "dimensions must be positive");
+
+        let display_ratio = c_val as f64 / r_val as f64;
+        let expected_ratio = (1920.0 / 1080.0) * 2.0; // cell_ratio=2
+        let diff = (display_ratio - expected_ratio).abs() / expected_ratio;
+        assert!(diff < 0.15, "aspect ratio off by {:.0}%: display {}/{} = {:.2}, expected {:.2}",
+            diff * 100.0, c_val, r_val, display_ratio, expected_ratio);
     }
 }
 
@@ -1855,7 +2060,6 @@ fn main() -> io::Result<()> {
 
     let mut last_image_area: Option<Rect> = None;
     let mut last_rendered_path = String::new();
-    let mut last_video_frame: usize = usize::MAX;
 
     loop {
         app.update_matches();
@@ -1876,7 +2080,6 @@ fn main() -> io::Result<()> {
             };
             match &app.preview_content {
                 PreviewContent::Image(ref img) => {
-                    // Only re-render if the image changed
                     if app.preview_path != last_rendered_path {
                         let _ = render_kitty_image(img, inner);
                         last_rendered_path = app.preview_path.clone();
@@ -1885,22 +2088,22 @@ fn main() -> io::Result<()> {
                 }
                 PreviewContent::Video(ref frames) | PreviewContent::VideoStreaming(ref frames) => {
                     if !frames.is_empty() {
+                        let mut frame_changed = false;
                         if app.video_frame_time.elapsed()
                             >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS)
                         {
                             app.video_frame = (app.video_frame + 1) % frames.len();
                             app.video_frame_time = Instant::now();
+                            frame_changed = true;
                         }
                         if app.video_frame >= frames.len() {
                             app.video_frame = 0;
+                            frame_changed = true;
                         }
-                        if app.video_frame != last_video_frame
-                            || app.preview_path != last_rendered_path
-                        {
+                        if frame_changed || app.preview_path != last_rendered_path {
                             if let Some(frame) = frames.get(app.video_frame) {
                                 let _ = render_kitty_image(frame, inner);
                             }
-                            last_video_frame = app.video_frame;
                             last_rendered_path = app.preview_path.clone();
                         }
                     }
@@ -1912,7 +2115,6 @@ fn main() -> io::Result<()> {
             let _ = clear_kitty_image();
             last_image_area = None;
             last_rendered_path.clear();
-            last_video_frame = usize::MAX;
         }
 
         // Poll with shorter timeout for smooth video, longer for static content
