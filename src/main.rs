@@ -111,6 +111,11 @@ enum PreviewContent {
     None,
 }
 
+enum ExitAction {
+    Open(String),
+    Drag(String),
+}
+
 struct App {
     query: String,
     files: Arc<Mutex<Vec<FileEntry>>>,
@@ -133,6 +138,7 @@ struct App {
     video_cache_pending: Arc<Mutex<Option<(String, Vec<CachedImage>)>>>,
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
+    drag_mode: bool,
 }
 
 impl App {
@@ -173,6 +179,7 @@ impl App {
             video_cache_pending: Arc::new(Mutex::new(None)),
             syntax_set,
             theme,
+            drag_mode: false,
         }
     }
 
@@ -713,6 +720,41 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
         height: new_h,
         is_raw_rgb: false,
     })
+}
+
+/// Decide whether a video frame should be rendered this cycle.
+/// Returns Some(frame_index) if we should render, None if we can skip.
+/// Also updates video_frame and video_frame_time when advancing.
+fn video_render_decision(
+    elapsed: Duration,
+    video_frame: &mut usize,
+    video_frame_time: &mut Instant,
+    frame_count: usize,
+    preview_path: &str,
+    last_rendered_path: &str,
+) -> Option<usize> {
+    if frame_count == 0 {
+        return None;
+    }
+
+    let mut frame_changed = false;
+
+    if elapsed >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS) {
+        *video_frame = (*video_frame + 1) % frame_count;
+        *video_frame_time = Instant::now();
+        frame_changed = true;
+    }
+
+    if *video_frame >= frame_count {
+        *video_frame = 0;
+        frame_changed = true;
+    }
+
+    if frame_changed || preview_path != last_rendered_path {
+        Some(*video_frame)
+    } else {
+        None
+    }
 }
 
 /// Render image using kitty graphics protocol to the given writer
@@ -1535,6 +1577,175 @@ mod tests {
         assert!(diff < 0.15, "aspect ratio off by {:.0}%: display {}/{} = {:.2}, expected {:.2}",
             diff * 100.0, c_val, r_val, display_ratio, expected_ratio);
     }
+
+    // --- Video render decision tests (flicker bugs) ---
+
+    #[test]
+    fn video_first_frame_must_render() {
+        // Bug: new video loads, video_frame=0, timer fresh, path not yet rendered.
+        // Must render frame 0 immediately — not skip it.
+        let mut frame = 0usize;
+        let mut time = Instant::now();
+        let result = video_render_decision(
+            Duration::from_millis(0), // just started, no time elapsed
+            &mut frame,
+            &mut time,
+            10,                      // 10 frames available
+            "/videos/test.mp4",      // current path
+            "",                      // last_rendered_path is empty (nothing rendered yet)
+        );
+        assert_eq!(result, Some(0), "first frame of a new video must always render");
+    }
+
+    #[test]
+    fn video_same_frame_same_path_skips() {
+        // Steady state: same video, timer hasn't elapsed, already rendered this frame.
+        // Should skip to avoid unnecessary re-renders.
+        let mut frame = 3usize;
+        let mut time = Instant::now();
+        let result = video_render_decision(
+            Duration::from_millis(10), // only 10ms, less than 66ms interval
+            &mut frame,
+            &mut time,
+            10,
+            "/videos/test.mp4",
+            "/videos/test.mp4",        // same path = already rendered
+        );
+        assert_eq!(result, None, "should skip render when frame unchanged and path matches");
+        assert_eq!(frame, 3, "frame index should not change");
+    }
+
+    #[test]
+    fn video_advances_after_interval() {
+        // Timer has elapsed — should advance to next frame and render.
+        let mut frame = 3usize;
+        let mut time = Instant::now() - Duration::from_millis(100);
+        let result = video_render_decision(
+            Duration::from_millis(100), // > 66ms
+            &mut frame,
+            &mut time,
+            10,
+            "/videos/test.mp4",
+            "/videos/test.mp4",
+        );
+        assert_eq!(result, Some(4), "should advance and render next frame");
+        assert_eq!(frame, 4);
+    }
+
+    #[test]
+    fn video_wraps_around() {
+        // At last frame, timer elapsed — should wrap to 0.
+        let mut frame = 9usize;
+        let mut time = Instant::now() - Duration::from_millis(100);
+        let result = video_render_decision(
+            Duration::from_millis(100),
+            &mut frame,
+            &mut time,
+            10,
+            "/videos/test.mp4",
+            "/videos/test.mp4",
+        );
+        assert_eq!(result, Some(0), "should wrap to frame 0");
+        assert_eq!(frame, 0);
+    }
+
+    #[test]
+    fn video_clamps_when_frames_shrink() {
+        // Edge case during streaming: we rendered frame 8, but now only 5 frames
+        // exist (e.g. path changed to shorter video). Must clamp and render.
+        let mut frame = 8usize;
+        let mut time = Instant::now();
+        let result = video_render_decision(
+            Duration::from_millis(0), // no time elapsed
+            &mut frame,
+            &mut time,
+            5,                        // only 5 frames now
+            "/videos/test.mp4",
+            "/videos/test.mp4",       // same path
+        );
+        assert_eq!(result, Some(0), "must clamp out-of-bounds frame and render");
+        assert_eq!(frame, 0);
+    }
+
+    #[test]
+    fn video_empty_frames_never_renders() {
+        let mut frame = 0usize;
+        let mut time = Instant::now();
+        let result = video_render_decision(
+            Duration::from_millis(100),
+            &mut frame,
+            &mut time,
+            0,                        // no frames yet
+            "/videos/test.mp4",
+            "",
+        );
+        assert_eq!(result, None, "must not render when there are no frames");
+    }
+
+    #[test]
+    fn video_path_change_triggers_render() {
+        // User navigated to a different video. Same frame index, timer not elapsed,
+        // but path changed — must render.
+        let mut frame = 0usize;
+        let mut time = Instant::now();
+        let result = video_render_decision(
+            Duration::from_millis(0),
+            &mut frame,
+            &mut time,
+            10,
+            "/videos/new.mp4",        // new video
+            "/videos/old.mp4",        // was showing old video
+        );
+        assert_eq!(result, Some(0), "path change must trigger render");
+    }
+
+    #[test]
+    fn video_no_flicker_simulation() {
+        // Simulate 20 render cycles at 16ms intervals for a 10-frame video.
+        // Every cycle must either render or have a valid reason to skip.
+        // The first cycle and every ~4th cycle (66ms/16ms) should render.
+        let mut frame = 0usize;
+        let mut time = Instant::now();
+        let mut last_path = String::new();
+        let path = "/videos/test.mp4";
+        let mut render_count = 0;
+        let mut gap = 0; // cycles since last render
+
+        for cycle in 0..20 {
+            let _elapsed = Duration::from_millis(cycle as u64 * 16);
+            // Simulate time passing
+            let fake_elapsed = if cycle == 0 {
+                Duration::from_millis(0)
+            } else {
+                // Time since last frame_time reset
+                Duration::from_millis((cycle - (render_count.max(1) - 1) * 4) as u64 * 16)
+            };
+
+            let result = video_render_decision(
+                fake_elapsed,
+                &mut frame,
+                &mut time,
+                10,
+                path,
+                &last_path,
+            );
+
+            if let Some(_idx) = result {
+                render_count += 1;
+                last_path = path.to_string();
+                gap = 0;
+            } else {
+                gap += 1;
+                // If we haven't rendered in 5+ cycles (80ms), that's a flicker bug.
+                // At 66ms interval, max gap should be ~4 cycles.
+                assert!(gap <= 5,
+                    "flicker detected: {} consecutive skipped renders at cycle {} (frame {})",
+                    gap, cycle, frame);
+            }
+        }
+
+        assert!(render_count >= 1, "must render at least the first frame");
+    }
 }
 
 fn open_file(path: &str) -> Result<(), String> {
@@ -1743,16 +1954,31 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         .alignment(ratatui::layout::Alignment::Center);
 
     // Help line
-    let help = Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" open  "),
-        Span::styled("Esc", Style::default().fg(Color::Cyan)),
-        Span::raw(" cancel  "),
-        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan)),
-        Span::raw(" nav  "),
-        Span::styled("^U", Style::default().fg(Color::Cyan)),
-        Span::raw(" clr"),
-    ]);
+    let help = if app.drag_mode {
+        Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" drag  "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::raw(" cancel  "),
+            Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan)),
+            Span::raw(" nav  "),
+            Span::styled("^U", Style::default().fg(Color::Cyan)),
+            Span::raw(" clr"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(" open  "),
+            Span::styled("^D", Style::default().fg(Color::Yellow)),
+            Span::raw(" drag  "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::raw(" cancel  "),
+            Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan)),
+            Span::raw(" nav  "),
+            Span::styled("^U", Style::default().fg(Color::Cyan)),
+            Span::raw(" clr"),
+        ])
+    };
     let help_widget = Paragraph::new(help)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(ratatui::layout::Alignment::Center);
@@ -2039,6 +2265,18 @@ fn run_test_video() -> io::Result<()> {
     Ok(())
 }
 
+fn drag_file(path: &str) -> Result<(), String> {
+    Command::new("ripdrag")
+        .args(["--and-exit", "--icons-only", "--icon-size", "48",
+               "--content-width", "64", "--content-height", "64", path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn ripdrag: {} (install with: cargo install ripdrag)", e))?;
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--profile") {
@@ -2047,6 +2285,7 @@ fn main() -> io::Result<()> {
     if args.iter().any(|arg| arg == "--test-video") {
         return run_test_video();
     }
+    let drag_mode = args.iter().any(|arg| arg == "--drag");
 
     // Setup terminal
     enable_raw_mode()?;
@@ -2056,7 +2295,8 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
-    let mut chosen: Option<String> = None;
+    app.drag_mode = drag_mode;
+    let mut chosen: Option<ExitAction> = None;
 
     let mut last_image_area: Option<Rect> = None;
     let mut last_rendered_path = String::new();
@@ -2087,25 +2327,18 @@ fn main() -> io::Result<()> {
                     last_image_area = Some(area);
                 }
                 PreviewContent::Video(ref frames) | PreviewContent::VideoStreaming(ref frames) => {
-                    if !frames.is_empty() {
-                        let mut frame_changed = false;
-                        if app.video_frame_time.elapsed()
-                            >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS)
-                        {
-                            app.video_frame = (app.video_frame + 1) % frames.len();
-                            app.video_frame_time = Instant::now();
-                            frame_changed = true;
+                    if let Some(idx) = video_render_decision(
+                        app.video_frame_time.elapsed(),
+                        &mut app.video_frame,
+                        &mut app.video_frame_time,
+                        frames.len(),
+                        &app.preview_path,
+                        &last_rendered_path,
+                    ) {
+                        if let Some(frame) = frames.get(idx) {
+                            let _ = render_kitty_image(frame, inner);
                         }
-                        if app.video_frame >= frames.len() {
-                            app.video_frame = 0;
-                            frame_changed = true;
-                        }
-                        if frame_changed || app.preview_path != last_rendered_path {
-                            if let Some(frame) = frames.get(app.video_frame) {
-                                let _ = render_kitty_image(frame, inner);
-                            }
-                            last_rendered_path = app.preview_path.clone();
-                        }
+                        last_rendered_path = app.preview_path.clone();
                     }
                     last_image_area = Some(area);
                 }
@@ -2133,7 +2366,17 @@ fn main() -> io::Result<()> {
                     (KeyCode::Esc, _) => break,
                     (KeyCode::Enter, _) => {
                         if let Some(file) = app.selected_file() {
-                            chosen = Some(file);
+                            if app.drag_mode {
+                                chosen = Some(ExitAction::Drag(file));
+                            } else {
+                                chosen = Some(ExitAction::Open(file));
+                            }
+                        }
+                        break;
+                    }
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        if let Some(file) = app.selected_file() {
+                            chosen = Some(ExitAction::Drag(file));
                         }
                         break;
                     }
@@ -2221,12 +2464,22 @@ fn main() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Open the file after terminal is restored
-    if let Some(path) = chosen {
-        if let Err(e) = open_file(&path) {
+    // Open or drag the file after terminal is restored
+    if let Some(action) = chosen {
+        let (path, result) = match action {
+            ExitAction::Drag(path) => {
+                let r = drag_file(&path);
+                (path, r)
+            }
+            ExitAction::Open(path) => {
+                let r = open_file(&path);
+                (path, r)
+            }
+        };
+        if let Err(e) = result {
             let _ = notify_rust::Notification::new()
                 .summary("File Picker")
-                .body(&e)
+                .body(&format!("{}: {}", path, e))
                 .show();
         }
     }
