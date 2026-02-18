@@ -2266,15 +2266,35 @@ fn run_test_video() -> io::Result<()> {
 }
 
 fn drag_file(path: &str) -> Result<(), String> {
-    Command::new("ripdrag")
-        .args(["--and-exit", "--icons-only", "--icon-size", "48",
-               "--content-width", "64", "--content-height", "64", path])
+    let ripdrag = which_ripdrag();
+    Command::new("setsid")
+        .arg("--fork")
+        .arg("sh")
+        .arg("-c")
+        .arg(format!(
+            "{} --and-exit --icons-only --icon-size 48 --content-width 64 --content-height 64 '{}' </dev/null >/dev/null 2>/dev/null",
+            ripdrag,
+            path.replace('\'', "'\\''")
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to spawn ripdrag: {} (install with: cargo install ripdrag)", e))?;
+        .map_err(|e| format!("Failed to spawn ripdrag: {}", e))?;
+    thread::sleep(Duration::from_millis(500));
     Ok(())
+}
+
+fn which_ripdrag() -> String {
+    for p in &[
+        "/home/jeremy/.local/bin/ripdrag",
+        "/home/jeremy/.cargo/bin/ripdrag",
+    ] {
+        if Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "ripdrag".to_string()
 }
 
 fn main() -> io::Result<()> {
