@@ -757,12 +757,13 @@ fn video_render_decision(
     }
 }
 
-/// Render image using kitty graphics protocol to the given writer
+/// Render image using kitty graphics protocol to the given writer.
+/// Does NOT toggle cursor visibility — the caller (main loop) is responsible
+/// for keeping the cursor hidden while kitty graphics are being written and
+/// restoring it afterwards, so that ratatui's cursor position is the only
+/// place the cursor ever becomes visible.  This eliminates the flicker that
+/// was caused by the old hide-show cycle inside every render call.
 fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) -> io::Result<()> {
-    // Hide cursor to prevent flicker during repositioning
-    write!(out, "\x1b[?25l")?;
-
-    // Calculate display cells that preserve aspect ratio.
     let cell_ratio = 2.0_f64;
     let img_ratio = (img.width as f64 / img.height as f64) * cell_ratio;
     let area_ratio = area.width as f64 / area.height as f64;
@@ -789,7 +790,6 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
 
     let b64_data = BASE64.encode(&img.data);
 
-    // Use i=1 to replace the previous image atomically (no clear/redraw flicker)
     let chunk_size = 4096;
     let chunks: Vec<&str> = b64_data
         .as_bytes()
@@ -830,15 +830,23 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
         }
     }
 
-    // Show cursor again
-    write!(out, "\x1b[?25h")?;
     out.flush()?;
     Ok(())
 }
 
-/// Render image using kitty graphics protocol
-fn render_kitty_image(img: &CachedImage, area: Rect) -> io::Result<()> {
-    render_kitty_image_to(img, area, &mut io::stdout())
+/// Render image using kitty graphics protocol.
+/// Hides the cursor for the duration of the write, then repositions it
+/// back to `cursor_pos` so that ratatui's input-field cursor doesn't
+/// jump around.  This is the *only* place cursor visibility is toggled
+/// during kitty graphics output.
+fn render_kitty_image(img: &CachedImage, area: Rect, cursor_pos: (u16, u16)) -> io::Result<()> {
+    let mut out = io::stdout();
+    write!(out, "\x1b[?25l")?;
+    render_kitty_image_to(img, area, &mut out)?;
+    write!(out, "\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1)?;
+    write!(out, "\x1b[?25h")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Clear any kitty graphics
@@ -1486,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_cursor_hidden_during_render() {
+    fn kitty_render_to_does_not_toggle_cursor() {
         let img = CachedImage {
             data: vec![0u8; 10],
             width: 10,
@@ -1498,12 +1506,41 @@ mod tests {
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
+        assert!(output.find("\x1b[?25l").is_none(),
+            "render_kitty_image_to must NOT hide cursor — caller handles it");
+        assert!(output.find("\x1b[?25h").is_none(),
+            "render_kitty_image_to must NOT show cursor — caller handles it");
+
+        assert!(output.find("\x1b_G").is_some(), "should still have kitty command");
+    }
+
+    #[test]
+    fn kitty_render_wrapper_cursor_sandwich() {
+        let img = CachedImage {
+            data: vec![0u8; 10],
+            width: 10,
+            height: 10,
+            is_raw_rgb: false,
+        };
+        let area = Rect { x: 5, y: 5, width: 20, height: 10 };
+        let cursor_pos: (u16, u16) = (12, 3);
+        let mut buf = Vec::new();
+
+        write!(buf, "\x1b[?25l").unwrap();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        write!(buf, "\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1).unwrap();
+        write!(buf, "\x1b[?25h").unwrap();
+
+        let output = String::from_utf8_lossy(&buf);
+
         let hide_pos = output.find("\x1b[?25l").expect("should hide cursor");
         let show_pos = output.rfind("\x1b[?25h").expect("should show cursor");
         let first_kitty = output.find("\x1b_G").expect("should have kitty command");
+        let cursor_move = output.rfind("\x1b[4;13H").expect("should reposition cursor");
 
         assert!(hide_pos < first_kitty, "cursor hide must come before kitty data");
-        assert!(show_pos > first_kitty, "cursor show must come after kitty data");
+        assert!(first_kitty < cursor_move, "kitty data must come before cursor reposition");
+        assert!(cursor_move < show_pos, "cursor reposition must come before cursor show");
     }
 
     #[test]
@@ -1746,6 +1783,71 @@ mod tests {
 
         assert!(render_count >= 1, "must render at least the first frame");
     }
+
+    #[test]
+    fn cursor_never_shown_at_wrong_position() {
+        let img = CachedImage {
+            data: vec![0u8; 100],
+            width: 200,
+            height: 100,
+            is_raw_rgb: false,
+        };
+        let area = Rect { x: 50, y: 5, width: 40, height: 20 };
+        let cursor_pos: (u16, u16) = (10, 2);
+
+        let mut buf = Vec::new();
+        write!(buf, "\x1b[?25l").unwrap();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        write!(buf, "\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1).unwrap();
+        write!(buf, "\x1b[?25h").unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let show_cursor_positions: Vec<usize> = output
+            .match_indices("\x1b[?25h")
+            .map(|(pos, _)| pos)
+            .collect();
+
+        assert_eq!(show_cursor_positions.len(), 1, "cursor should be shown exactly once");
+
+        let expected_reposition = format!("\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1);
+        let reposition_pos = output.rfind(&expected_reposition)
+            .expect("must reposition cursor to input field");
+        assert!(reposition_pos < show_cursor_positions[0],
+            "cursor must be repositioned to input field BEFORE being shown");
+    }
+
+    #[test]
+    fn video_rapid_frames_no_cursor_leak() {
+        let frames: Vec<CachedImage> = (0..5).map(|i| CachedImage {
+            data: vec![i as u8; 50],
+            width: 10,
+            height: 10,
+            is_raw_rgb: false,
+        }).collect();
+        let area = Rect { x: 50, y: 5, width: 40, height: 20 };
+        let cursor_pos: (u16, u16) = (10, 2);
+
+        let mut combined = Vec::new();
+        for frame in &frames {
+            write!(combined, "\x1b[?25l").unwrap();
+            render_kitty_image_to(frame, area, &mut combined).unwrap();
+            write!(combined, "\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1).unwrap();
+            write!(combined, "\x1b[?25h").unwrap();
+        }
+        let output = String::from_utf8_lossy(&combined);
+
+        let hide_count = output.matches("\x1b[?25l").count();
+        let show_count = output.matches("\x1b[?25h").count();
+        assert_eq!(hide_count, show_count,
+            "every cursor hide must be paired with a show: {} hides, {} shows",
+            hide_count, show_count);
+
+        let reposition = format!("\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1);
+        let reposition_count = output.matches(&reposition).count();
+        assert_eq!(reposition_count, show_count,
+            "every cursor show must be preceded by a reposition to input: {} repositions, {} shows",
+            reposition_count, show_count);
+    }
 }
 
 fn open_file(path: &str) -> Result<(), String> {
@@ -1865,7 +1967,7 @@ fn build_file_items<'a>(
         .collect()
 }
 
-fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
+fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
     let area = frame.area();
     let wide_mode = area.width >= 100;
     let dual_columns = area.width >= 140;
@@ -1992,7 +2094,7 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
                 .title(Span::styled(" \u{f002} ", Style::default().fg(Color::Cyan))),
         );
 
-    let preview_area = if dual_columns {
+    let (preview_area, cursor_pos) = if dual_columns {
         // Extra wide: dual file columns + preview
         let main_chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -2043,12 +2145,13 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         frame.render_widget(help_widget, left_chunks[3]);
         frame.render_widget(preview, main_chunks[1]);
 
-        frame.set_cursor_position((
+        let cursor_pos = (
             left_chunks[0].x + app.query.len() as u16 + 1,
             left_chunks[0].y + 1,
-        ));
+        );
+        frame.set_cursor_position(cursor_pos);
 
-        main_chunks[1]
+        (main_chunks[1], cursor_pos)
     } else if wide_mode {
         // Wide: side-by-side layout
         let main_chunks = Layout::default()
@@ -2079,12 +2182,13 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         frame.render_widget(help_widget, left_chunks[3]);
         frame.render_widget(preview, main_chunks[1]);
 
-        frame.set_cursor_position((
+        let cursor_pos = (
             left_chunks[0].x + app.query.len() as u16 + 1,
             left_chunks[0].y + 1,
-        ));
+        );
+        frame.set_cursor_position(cursor_pos);
 
-        main_chunks[1]
+        (main_chunks[1], cursor_pos)
     } else {
         // Narrow: list and preview split vertically
         let chunks = Layout::default()
@@ -2111,18 +2215,19 @@ fn ui(frame: &mut Frame, app: &App) -> Option<Rect> {
         frame.render_widget(status_widget, chunks[3]);
         frame.render_widget(help_widget, chunks[4]);
 
-        frame.set_cursor_position((
+        let cursor_pos = (
             chunks[0].x + app.query.len() as u16 + 1,
             chunks[0].y + 1,
-        ));
+        );
+        frame.set_cursor_position(cursor_pos);
 
-        chunks[2]
+        (chunks[2], cursor_pos)
     };
 
     if needs_graphics {
-        Some(preview_area)
+        (Some(preview_area), cursor_pos)
     } else {
-        None
+        (None, cursor_pos)
     }
 }
 
@@ -2312,11 +2417,13 @@ fn main() -> io::Result<()> {
         app.update_preview();
 
         let mut image_area: Option<Rect> = None;
+        let mut cursor_pos = (0u16, 0u16);
         terminal.draw(|f| {
-            image_area = ui(f, &app);
+            let result = ui(f, &app);
+            image_area = result.0;
+            cursor_pos = result.1;
         })?;
 
-        // Render kitty graphics for image/video preview
         if let Some(area) = image_area {
             let inner = Rect {
                 x: area.x + 1,
@@ -2327,7 +2434,7 @@ fn main() -> io::Result<()> {
             match &app.preview_content {
                 PreviewContent::Image(ref img) => {
                     if app.preview_path != last_rendered_path {
-                        let _ = render_kitty_image(img, inner);
+                        let _ = render_kitty_image(img, inner, cursor_pos);
                         last_rendered_path = app.preview_path.clone();
                     }
                     last_image_area = Some(area);
@@ -2342,7 +2449,7 @@ fn main() -> io::Result<()> {
                         &last_rendered_path,
                     ) {
                         if let Some(frame) = frames.get(idx) {
-                            let _ = render_kitty_image(frame, inner);
+                            let _ = render_kitty_image(frame, inner, cursor_pos);
                         }
                         last_rendered_path = app.preview_path.clone();
                     }
