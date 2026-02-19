@@ -527,6 +527,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "image",
+ "libc",
  "notify-rust",
  "rapidfuzz",
  "ratatui",
