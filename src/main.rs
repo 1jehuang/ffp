@@ -2533,6 +2533,233 @@ fn run_test_video() -> io::Result<()> {
     Ok(())
 }
 
+struct WriteRecorder<W: Write> {
+    inner: W,
+    writes: Vec<(Instant, usize, Vec<u8>)>,
+}
+
+impl<W: Write> WriteRecorder<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, writes: Vec::new() }
+    }
+}
+
+impl<W: Write> Write for WriteRecorder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.writes.push((Instant::now(), n, buf[..n].to_vec()));
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn run_bench_flicker() -> io::Result<()> {
+    let area = Rect { x: 60, y: 2, width: 50, height: 25 };
+    let cursor_input = (15u16, 1u16);
+
+    let frame_w = 160u32;
+    let frame_h = 90u32;
+    let frames: Vec<CachedImage> = (0..30).map(|i| {
+        let mut data = vec![0u8; (frame_w * frame_h * 3) as usize];
+        for (j, b) in data.iter_mut().enumerate() {
+            *b = ((i * 7 + j) & 0xFF) as u8;
+        }
+        CachedImage { data, width: frame_w, height: frame_h, is_raw_rgb: true }
+    }).collect();
+
+    eprintln!("=== Flicker Benchmark ===");
+    eprintln!("  {} frames, {}x{} raw RGB", frames.len(), frame_w, frame_h);
+    eprintln!("  frame data size: {} bytes", frames[0].data.len());
+    eprintln!();
+
+    // --- Approach A: current atomic-buffer approach ---
+    {
+        let mut recorder = WriteRecorder::new(Vec::<u8>::new());
+        let start = Instant::now();
+        let mut video_frame = 0usize;
+        let mut video_frame_time = Instant::now();
+        let mut last_rendered_path = String::new();
+        let preview_path = "/bench/video.mp4";
+
+        for cycle in 0..120 {
+            // Simulate ratatui draw output (cursor show at input)
+            write!(recorder, "\x1b[{};{}H\x1b[?25h", cursor_input.1 + 1, cursor_input.0 + 1)?;
+
+            let elapsed = if cycle == 0 {
+                Duration::from_millis(0)
+            } else {
+                video_frame_time.elapsed()
+            };
+
+            if let Some(idx) = video_render_decision(
+                elapsed,
+                &mut video_frame,
+                &mut video_frame_time,
+                frames.len(),
+                preview_path,
+                &last_rendered_path,
+            ) {
+                if let Some(frame) = frames.get(idx) {
+                    let mut buf: Vec<u8> = Vec::with_capacity(frame.data.len() * 2);
+                    write!(buf, "\x1b[?25l")?;
+                    render_kitty_image_to(frame, area, &mut buf)?;
+                    write!(buf, "\x1b[{};{}H\x1b[?25h", cursor_input.1 + 1, cursor_input.0 + 1)?;
+                    recorder.write_all(&buf)?;
+                    recorder.flush()?;
+                }
+                last_rendered_path = preview_path.to_string();
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+
+        let elapsed = start.elapsed();
+        analyze_writes("Atomic buffer (current)", &recorder.writes, elapsed);
+    }
+
+    // --- Approach B: old direct-to-stdout (simulated) ---
+    {
+        let mut recorder = WriteRecorder::new(Vec::<u8>::new());
+        let start = Instant::now();
+        let mut video_frame = 0usize;
+        let mut video_frame_time = Instant::now();
+        let mut last_rendered_path = String::new();
+        let preview_path = "/bench/video.mp4";
+
+        for cycle in 0..120 {
+            write!(recorder, "\x1b[{};{}H\x1b[?25h", cursor_input.1 + 1, cursor_input.0 + 1)?;
+
+            let elapsed = if cycle == 0 {
+                Duration::from_millis(0)
+            } else {
+                video_frame_time.elapsed()
+            };
+
+            if let Some(idx) = video_render_decision(
+                elapsed,
+                &mut video_frame,
+                &mut video_frame_time,
+                frames.len(),
+                preview_path,
+                &last_rendered_path,
+            ) {
+                if let Some(frame) = frames.get(idx) {
+                    // Old approach: write directly, each write! is a separate syscall
+                    write!(recorder, "\x1b[?25l")?;
+                    recorder.flush()?;
+                    render_kitty_image_to(frame, area, &mut recorder)?;
+                    recorder.flush()?;
+                    write!(recorder, "\x1b[?25h")?;
+                    recorder.flush()?;
+                }
+                last_rendered_path = preview_path.to_string();
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+
+        let elapsed = start.elapsed();
+        analyze_writes("Direct writes (old)", &recorder.writes, elapsed);
+    }
+
+    Ok(())
+}
+
+fn analyze_writes(label: &str, writes: &[(Instant, usize, Vec<u8>)], elapsed: Duration) {
+    eprintln!("--- {} ({:?}) ---", label, elapsed);
+    eprintln!("  total writes: {}", writes.len());
+    
+    let total_bytes: usize = writes.iter().map(|(_, n, _)| n).sum();
+    eprintln!("  total bytes: {} ({:.1} MiB)", total_bytes, total_bytes as f64 / (1024.0 * 1024.0));
+    
+    let sizes: Vec<usize> = writes.iter().map(|(_, n, _)| *n).collect();
+    if !sizes.is_empty() {
+        let min = sizes.iter().min().unwrap();
+        let max = sizes.iter().max().unwrap();
+        let avg = total_bytes / sizes.len();
+        eprintln!("  write sizes: min={} avg={} max={}", min, avg, max);
+    }
+
+    // Count flicker events: cursor show while not at input position
+    let input_pos = format!("\x1b[{};{}H", 2, 16); // cursor_input.1+1, cursor_input.0+1
+    let mut cursor_visible = false;
+    let mut cursor_at_input = false;
+    let mut flicker_count = 0;
+    let mut kitty_while_visible = 0;
+    let mut kitty_renders = 0;
+    let mut show_without_reposition = 0;
+
+    // Track state across ALL writes (simulating what terminal sees)
+    for (_time, _n, data) in writes {
+        let s = String::from_utf8_lossy(data);
+        let mut pos = 0;
+        let bytes = s.as_bytes();
+        
+        while pos < bytes.len() {
+            if s[pos..].starts_with("\x1b[?25h") {
+                if !cursor_at_input {
+                    show_without_reposition += 1;
+                }
+                cursor_visible = true;
+                pos += 6;
+            } else if s[pos..].starts_with("\x1b[?25l") {
+                cursor_visible = false;
+                pos += 6;
+            } else if s[pos..].starts_with(&input_pos) {
+                cursor_at_input = true;
+                pos += input_pos.len();
+            } else if s[pos..].starts_with("\x1b[") && !s[pos..].starts_with("\x1b[?") {
+                cursor_at_input = false;
+                if let Some(end) = s[pos + 2..].find(|c: char| c.is_ascii_alphabetic()) {
+                    pos += 2 + end + 1;
+                } else {
+                    pos += 1;
+                }
+            } else if s[pos..].starts_with("\x1b_G") {
+                kitty_renders += 1;
+                if cursor_visible {
+                    kitty_while_visible += 1;
+                    flicker_count += 1;
+                }
+                if let Some(end) = s[pos + 2..].find("\x1b\\") {
+                    pos += 2 + end + 2;
+                } else {
+                    pos += 1;
+                }
+            } else {
+                pos += 1;
+            }
+        }
+    }
+
+    eprintln!("  kitty renders: {}", kitty_renders);
+    eprintln!("  FLICKER - kitty while cursor visible: {}", kitty_while_visible);
+    eprintln!("  FLICKER - cursor shown without reposition: {}", show_without_reposition);
+    eprintln!("  total flicker events: {}", flicker_count);
+
+    // Count write boundaries that split hide/show
+    let mut split_flushes = 0;
+    let mut pending_hide = false;
+    for (_time, _n, data) in writes {
+        let s = String::from_utf8_lossy(data);
+        if s.contains("\x1b[?25l") {
+            pending_hide = true;
+        }
+        if s.contains("\x1b[?25h") {
+            if !pending_hide && s.find("\x1b[?25l").is_none() {
+                // show without hide in same write — could be ratatui's show, that's OK
+            }
+            pending_hide = false;
+        }
+        if pending_hide {
+            // hide was in a previous write, show hasn't arrived yet
+            split_flushes += 1;
+        }
+    }
+    eprintln!("  split hide/show across writes: {}", split_flushes);
+    eprintln!();
+}
+
 fn drag_file(path: &str) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     unsafe {
@@ -2558,6 +2785,9 @@ fn main() -> io::Result<()> {
     }
     if args.iter().any(|arg| arg == "--test-video") {
         return run_test_video();
+    }
+    if args.iter().any(|arg| arg == "--bench-flicker") {
+        return run_bench_flicker();
     }
     let drag_mode = args.iter().any(|arg| arg == "--drag");
 
