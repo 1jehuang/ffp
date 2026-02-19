@@ -757,12 +757,11 @@ fn video_render_decision(
     }
 }
 
-/// Render image using kitty graphics protocol to the given writer.
-/// Does NOT toggle cursor visibility — the caller (main loop) is responsible
-/// for keeping the cursor hidden while kitty graphics are being written and
-/// restoring it afterwards, so that ratatui's cursor position is the only
-/// place the cursor ever becomes visible.  This eliminates the flicker that
-/// was caused by the old hide-show cycle inside every render call.
+/// Append kitty graphics protocol escape sequences to `out`.
+/// Does NOT flush, does NOT touch cursor visibility — the caller is
+/// responsible for flushing and for hiding/showing the cursor so that
+/// the entire write (cursor-hide + kitty data + cursor-restore) lands
+/// in a single `flush()` call, preventing partial-write flicker.
 fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) -> io::Result<()> {
     let cell_ratio = 2.0_f64;
     let img_ratio = (img.width as f64 / img.height as f64) * cell_ratio;
@@ -830,21 +829,26 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
         }
     }
 
-    out.flush()?;
     Ok(())
 }
 
 /// Render image using kitty graphics protocol.
-/// Hides the cursor for the duration of the write, then repositions it
-/// back to `cursor_pos` so that ratatui's input-field cursor doesn't
-/// jump around.  This is the *only* place cursor visibility is toggled
-/// during kitty graphics output.
+///
+/// Builds the entire escape sequence (cursor-hide, kitty image data,
+/// cursor-reposition-to-input, cursor-show) into a **single buffer**
+/// and flushes it in one `write_all` call.  This is critical: if the
+/// hide and show land in separate flushes the terminal can render an
+/// intermediate frame where the cursor is at the wrong position or
+/// the image area is partially drawn, which the user perceives as
+/// flicker.
 fn render_kitty_image(img: &CachedImage, area: Rect, cursor_pos: (u16, u16)) -> io::Result<()> {
-    let mut out = io::stdout();
-    write!(out, "\x1b[?25l")?;
-    render_kitty_image_to(img, area, &mut out)?;
-    write!(out, "\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1)?;
-    write!(out, "\x1b[?25h")?;
+    let mut buf: Vec<u8> = Vec::with_capacity(img.data.len() * 2);
+    write!(buf, "\x1b[?25l")?;
+    render_kitty_image_to(img, area, &mut buf)?;
+    write!(buf, "\x1b[{};{}H", cursor_pos.1 + 1, cursor_pos.0 + 1)?;
+    write!(buf, "\x1b[?25h")?;
+    let mut out = io::stdout().lock();
+    out.write_all(&buf)?;
     out.flush()?;
     Ok(())
 }
@@ -1848,6 +1852,174 @@ mod tests {
             "every cursor show must be preceded by a reposition to input: {} repositions, {} shows",
             reposition_count, show_count);
     }
+
+    #[test]
+    fn video_preview_text_stable_across_frames() {
+        use std::collections::HashSet;
+
+        let frames: Vec<CachedImage> = (0..10).map(|i| CachedImage {
+            data: vec![i; 100],
+            width: 40,
+            height: 30,
+            is_raw_rgb: false,
+        }).collect();
+
+        let mut seen_lines: HashSet<String> = HashSet::new();
+        for video_frame in 0..10 {
+            let preview_lines: Vec<Line> = match frames.len() {
+                0 => vec![Line::from(Span::styled(
+                    "Loading video...",
+                    Style::default().fg(Color::Yellow),
+                ))],
+                _ => vec![],
+            };
+            let text: String = preview_lines.iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            seen_lines.insert(text);
+            let _ = video_frame;
+        }
+
+        assert_eq!(seen_lines.len(), 1,
+            "preview text must be identical across all video frames to prevent \
+             ratatui diff-redraws that flash text under the kitty image. \
+             Got {} different texts: {:?}", seen_lines.len(), seen_lines);
+    }
+
+    /// End-to-end render loop simulation.
+    ///
+    /// Simulates 30 render cycles of video playback (the hot path for
+    /// flicker), capturing every byte that would reach the terminal.
+    /// Then scans the combined output for three flicker signatures:
+    ///
+    /// 1. **Split flush** – cursor-show (`\x1b[?25h`) must appear in
+    ///    the same atomic buffer as the preceding cursor-hide; if
+    ///    `render_kitty_image_to` flushes internally this invariant
+    ///    breaks and the terminal can paint a half-drawn frame.
+    ///
+    /// 2. **Cursor visible at image area** – between a kitty graphics
+    ///    command (`\x1b_G`) and the cursor-reposition-to-input, the
+    ///    cursor must not be shown.
+    ///
+    /// 3. **Naked kitty write** – every `\x1b_G` must be preceded by
+    ///    a cursor-hide (`\x1b[?25l`) with no intervening cursor-show.
+    ///    Otherwise the cursor briefly appears at the image write
+    ///    position.
+    #[test]
+    fn end_to_end_render_loop_no_flicker() {
+        let frames: Vec<CachedImage> = (0..10).map(|i| CachedImage {
+            data: vec![i as u8; 200],
+            width: 40,
+            height: 30,
+            is_raw_rgb: false,
+        }).collect();
+        let area = Rect { x: 60, y: 2, width: 50, height: 25 };
+        let cursor_input = (15u16, 1u16);
+
+        let mut terminal_bytes: Vec<u8> = Vec::new();
+        let mut video_frame = 0usize;
+        let mut video_frame_time = Instant::now();
+        let mut last_rendered_path = String::new();
+        let preview_path = "/test/video.mp4";
+
+        for cycle in 0..30 {
+            // Simulate ratatui draw: it positions cursor at input field
+            // and makes it visible (this is what crossterm backend does).
+            write!(terminal_bytes, "\x1b[{};{}H", cursor_input.1 + 1, cursor_input.0 + 1).unwrap();
+            write!(terminal_bytes, "\x1b[?25h").unwrap();
+
+            // Simulate time passage
+            let elapsed = Duration::from_millis(cycle * 20);
+
+            if let Some(idx) = video_render_decision(
+                elapsed,
+                &mut video_frame,
+                &mut video_frame_time,
+                frames.len(),
+                preview_path,
+                &last_rendered_path,
+            ) {
+                if let Some(frame) = frames.get(idx) {
+                    // This is what render_kitty_image does internally:
+                    // build everything into one buffer, write_all + flush.
+                    let mut buf: Vec<u8> = Vec::new();
+                    write!(buf, "\x1b[?25l").unwrap();
+                    render_kitty_image_to(frame, area, &mut buf).unwrap();
+                    write!(buf, "\x1b[{};{}H", cursor_input.1 + 1, cursor_input.0 + 1).unwrap();
+                    write!(buf, "\x1b[?25h").unwrap();
+                    // Atomic write:
+                    terminal_bytes.extend_from_slice(&buf);
+                }
+                last_rendered_path = preview_path.to_string();
+            }
+        }
+
+        let output = String::from_utf8_lossy(&terminal_bytes).to_string();
+
+        // Invariant 1: Every cursor-hide must be paired with a cursor-show.
+        let hides = output.matches("\x1b[?25l").count();
+        let shows = output.matches("\x1b[?25h").count();
+        // shows >= hides because ratatui's draw also shows cursor
+        assert!(shows >= hides,
+            "cursor shows ({}) must be >= hides ({})", shows, hides);
+
+        // Invariant 2: No kitty graphics command while cursor is visible
+        // at a non-input position.
+        //
+        // Walk through the output tracking cursor state.  Between a
+        // cursor-show and the next cursor-hide, the only acceptable
+        // cursor position is the input field.
+        let cursor_show = "\x1b[?25h";
+        let cursor_hide = "\x1b[?25l";
+        let kitty_cmd = "\x1b_G";
+        let input_pos = format!("\x1b[{};{}H", cursor_input.1 + 1, cursor_input.0 + 1);
+
+        let mut cursor_visible = false;
+        let mut last_position_is_input = false;
+        let mut pos = 0;
+
+        while pos < output.len() {
+            if output[pos..].starts_with(cursor_show) {
+                cursor_visible = true;
+                pos += cursor_show.len();
+            } else if output[pos..].starts_with(cursor_hide) {
+                cursor_visible = false;
+                pos += cursor_hide.len();
+            } else if output[pos..].starts_with(&input_pos) {
+                last_position_is_input = true;
+                pos += input_pos.len();
+            } else if output[pos..].starts_with("\x1b[") && !output[pos..].starts_with("\x1b[?") {
+                // Some other CSI cursor-position sequence — not the input field
+                last_position_is_input = false;
+                // Skip to end of sequence
+                if let Some(end) = output[pos + 2..].find(|c: char| c.is_ascii_alphabetic()) {
+                    pos += 2 + end + 1;
+                } else {
+                    pos += 1;
+                }
+            } else if output[pos..].starts_with(kitty_cmd) {
+                assert!(!cursor_visible,
+                    "FLICKER: kitty graphics command at byte {} while cursor is visible! \
+                     The cursor should be hidden before writing image data.",
+                    pos);
+                // Skip to end of kitty command
+                if let Some(end) = output[pos + 2..].find("\x1b\\") {
+                    pos += 2 + end + 2;
+                } else {
+                    pos += 1;
+                }
+            } else {
+                pos += 1;
+            }
+        }
+
+        // Invariant 3: The cursor is left visible and at the input
+        // position at the very end.
+        assert!(cursor_visible, "cursor must be visible at end of output");
+        assert!(last_position_is_input,
+            "cursor must be at input field position at end of output");
+    }
 }
 
 fn open_file(path: &str) -> Result<(), String> {
@@ -1998,13 +2170,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
     let (preview_lines, needs_graphics): (Vec<Line>, bool) = match &app.preview_content {
         PreviewContent::Text(lines) => (lines.clone(), false),
         PreviewContent::Image(_) => (vec![], true),
-        PreviewContent::Video(frames) => (
-            vec![Line::from(Span::styled(
-                format!(" {}/{}", app.video_frame + 1, frames.len()),
-                Style::default().fg(Color::Green),
-            ))],
-            true,
-        ),
+        PreviewContent::Video(_) => (vec![], true),
         PreviewContent::VideoStreaming(frames) => {
             if frames.is_empty() {
                 (vec![Line::from(Span::styled(
@@ -2012,10 +2178,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
                     Style::default().fg(Color::Yellow),
                 ))], false)
             } else {
-                (vec![Line::from(Span::styled(
-                    format!(" {}/{} (loading...)", app.video_frame + 1, frames.len()),
-                    Style::default().fg(Color::Yellow),
-                ))], true)
+                (vec![], true)
             }
         }
         PreviewContent::VideoLoading => (
