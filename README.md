@@ -2,6 +2,8 @@
 
 A fuzzy file picker for the terminal with image preview support using the Kitty graphics protocol.
 
+<img width="2877" height="1762" alt="image" src="https://github.com/user-attachments/assets/d3937bbd-80fb-4eec-8ee5-4b3c984f08ad" />
+
 ## Features
 
 - Fuzzy file search with rapidfuzz
