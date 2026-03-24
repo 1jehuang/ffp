@@ -3,6 +3,7 @@
 A fuzzy file picker for the terminal with image preview support using the Kitty graphics protocol.
 
 <img width="2877" height="1762" alt="image" src="https://github.com/user-attachments/assets/d3937bbd-80fb-4eec-8ee5-4b3c984f08ad" />
+<img width="2877" height="1762" alt="image" src="https://github.com/user-attachments/assets/8fabe1f0-131d-495f-8153-eccf2038eeb8" />
 
 ## Features
 
