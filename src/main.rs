@@ -33,6 +33,7 @@ use std::{
 
 const MATCH_LIMIT: usize = 50;
 const FILE_BATCH_SIZE: usize = 256;
+const FILE_LOOKBACK_WINDOW: &str = "9d";
 const IMAGE_CACHE_SIZE: usize = 10;
 const THUMBNAIL_MAX_WIDTH: u32 = 800;
 const THUMBNAIL_MAX_HEIGHT: u32 = 600;
@@ -94,6 +95,7 @@ struct FileEntry {
     name_lower: String,
     dir: String,
     mtime: SystemTime,
+    is_dir: bool,
 }
 
 #[derive(Clone)]
@@ -139,10 +141,11 @@ struct App {
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
     drag_mode: bool,
+    dir_mode: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(dir_mode: bool) -> Self {
         let files = Arc::new(Mutex::new(Vec::new()));
         let loading = Arc::new(Mutex::new(true));
 
@@ -150,7 +153,7 @@ impl App {
         let files_clone = Arc::clone(&files);
         let loading_clone = Arc::clone(&loading);
         thread::spawn(move || {
-            load_files(files_clone, loading_clone);
+            load_entries(files_clone, loading_clone, dir_mode);
         });
 
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -180,6 +183,7 @@ impl App {
             syntax_set,
             theme,
             drag_mode: false,
+            dir_mode,
         }
     }
 
@@ -287,11 +291,16 @@ impl App {
             }
         } else {
             let lines = read_preview(&current_path, 40);
+            let is_dir = fs::metadata(&current_path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
             // Error/info messages (single line starting with '[') stay plain
             if lines.len() == 1 && lines[0].starts_with('[') {
                 self.preview_content = PreviewContent::Text(vec![
                     Line::from(Span::styled(lines[0].clone(), Style::default().fg(Color::DarkGray)))
                 ]);
+            } else if is_dir {
+                self.preview_content = PreviewContent::Text(plain_preview(lines));
             } else {
                 self.preview_content = PreviewContent::Text(
                     highlight_preview(&lines, &current_path, &self.syntax_set, &self.theme)
@@ -358,20 +367,34 @@ impl App {
     }
 }
 
-fn load_files(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>) {
+fn load_entries(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>, dir_mode: bool) {
+    let mut args = vec![
+        ".".to_string(),
+        dirs::home_dir().unwrap().to_string_lossy().to_string(),
+        "/tmp".to_string(),
+        "-t".to_string(),
+        if dir_mode { "d" } else { "f" }.to_string(),
+    ];
+
+    if !dir_mode {
+        args.push("--changed-within".to_string());
+        args.push(FILE_LOOKBACK_WINDOW.to_string());
+    }
+
+    args.extend([
+        "-H".to_string(),
+        "-E".to_string(),
+        ".git".to_string(),
+        "-E".to_string(),
+        "node_modules".to_string(),
+        "-E".to_string(),
+        ".cache".to_string(),
+        "-E".to_string(),
+        ".npm".to_string(),
+    ]);
+
     let child = Command::new("fd")
-        .args([
-            ".",
-            &dirs::home_dir().unwrap().to_string_lossy().to_string(),
-            "/tmp",
-            "-t", "f",
-            "--changed-within", "2d",
-            "-H",
-            "-E", ".git",
-            "-E", "node_modules",
-            "-E", ".cache",
-            "-E", ".npm",
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .spawn();
 
@@ -411,6 +434,10 @@ fn load_files(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>) {
     *loading.lock().unwrap() = false;
 }
 
+fn load_files(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>) {
+    load_entries(files, loading, false);
+}
+
 fn basename(path: &str) -> &str {
     Path::new(path)
         .file_name()
@@ -430,8 +457,10 @@ impl FileEntry {
         let name = basename(&path).to_string();
         let dir = dirname(&path).to_string();
         let name_lower = name.to_lowercase();
-        let mtime = fs::metadata(&path)
-            .and_then(|m| m.modified())
+        let metadata = fs::metadata(&path).ok();
+        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let mtime = metadata
+            .and_then(|m| m.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
         Self {
@@ -440,13 +469,70 @@ impl FileEntry {
             name_lower,
             dir,
             mtime,
+            is_dir,
         }
     }
+}
+
+fn read_directory_preview(path: &str, max_lines: usize) -> Vec<String> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return vec!["[Cannot read directory]".to_string()],
+    };
+
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by(|a, b| {
+        let a_is_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let b_is_dir = b.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        b_is_dir
+            .cmp(&a_is_dir)
+            .then_with(|| a.file_name().cmp(&b.file_name()))
+    });
+
+    let body_limit = max_lines.saturating_sub(1);
+    let mut lines = vec![format!("Directory: {}", path)];
+
+    if body_limit == 0 {
+        return lines;
+    }
+
+    if entries.is_empty() {
+        lines.push("[empty directory]".to_string());
+        return lines;
+    }
+
+    for entry in entries.iter().take(body_limit) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        lines.push(if is_dir { format!("{}/", name) } else { name });
+    }
+
+    if entries.len() > body_limit {
+        lines.push(format!("… {} more", entries.len() - body_limit));
+    }
+
+    lines
+}
+
+fn plain_preview(lines: Vec<String>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| Line::from(Span::raw(line)))
+        .collect()
 }
 
 fn read_preview(path: &str, max_lines: usize) -> Vec<String> {
     if path.is_empty() {
         return vec!["No file selected".to_string()];
+    }
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return vec!["[Cannot read file]".to_string()],
+    };
+
+    if metadata.is_dir() {
+        return read_directory_preview(path, max_lines);
     }
 
     let file = match fs::File::open(path) {
@@ -1357,6 +1443,15 @@ fn run_profile() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ffp-test-{}-{}-{}", std::process::id(), nanos, name))
+    }
 
     #[test]
     fn fuzzy_match_empty_query_returns_first_items() {
@@ -1388,6 +1483,35 @@ mod tests {
         let matches = fuzzy_match("résumé", &files, 10);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].index, 0);
+    }
+
+    #[test]
+    fn file_entry_marks_directories() {
+        let dir = unique_temp_path("dir-entry");
+        fs::create_dir_all(&dir).unwrap();
+
+        let entry = FileEntry::new(dir.to_string_lossy().to_string());
+        assert!(entry.is_dir);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_preview_lists_directory_contents() {
+        let dir = unique_temp_path("dir-preview");
+        let child_dir = dir.join("nested");
+        let child_file = dir.join("hello.txt");
+
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(&child_file, "hello").unwrap();
+
+        let preview = read_preview(&dir.to_string_lossy(), 10);
+        assert!(!preview.is_empty());
+        assert!(preview[0].starts_with("Directory: "));
+        assert!(preview.iter().any(|line| line == "nested/"));
+        assert!(preview.iter().any(|line| line == "hello.txt"));
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn parse_kitty_commands(data: &str) -> Vec<String> {
@@ -2035,17 +2159,26 @@ fn build_file_items<'a>(
             let entry = files.get(matched.index)?;
             let fname = &entry.name;
             let dir = &entry.dir;
-            let (icon, icon_color) = get_icon(fname);
+            let (icon, icon_color) = if entry.is_dir {
+                ("\u{f115}", Color::Cyan)
+            } else {
+                get_icon(fname)
+            };
             let time = time_ago(entry.mtime);
 
             // Split filename into stem and extension
-            let p = Path::new(fname);
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(fname);
-            let ext_part = p
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|e| format!(".{}", e))
-                .unwrap_or_default();
+            let (stem, ext_part) = if entry.is_dir {
+                (fname.as_str(), String::new())
+            } else {
+                let p = Path::new(fname);
+                (
+                    p.file_stem().and_then(|s| s.to_str()).unwrap_or(fname),
+                    p.extension()
+                        .and_then(|s| s.to_str())
+                        .map(|e| format!(".{}", e))
+                        .unwrap_or_default(),
+                )
+            };
 
             Some(ListItem::new(Line::from(vec![
                 Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
@@ -2122,10 +2255,14 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
             false,
         ),
     };
-    let preview_title = match &app.preview_content {
-        PreviewContent::Video(_) | PreviewContent::VideoStreaming(_) | PreviewContent::VideoLoading => " Video ",
-        PreviewContent::Image(_) => " Image ",
-        _ => " Preview ",
+    let preview_title = if app.dir_mode {
+        " Directory "
+    } else {
+        match &app.preview_content {
+            PreviewContent::Video(_) | PreviewContent::VideoStreaming(_) | PreviewContent::VideoLoading => " Video ",
+            PreviewContent::Image(_) => " Image ",
+            _ => " Preview ",
+        }
     };
     let preview = Paragraph::new(preview_lines).block(
         Block::default()
@@ -2135,10 +2272,11 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
 
     // Status line
     let status = format!(
-        "{} matches{} | {} files",
+        "{} matches{} | {} {}",
         app.matches.len(),
         if app.is_loading() { " (loading...)" } else { "" },
-        file_count
+        file_count,
+        if app.dir_mode { "dirs" } else { "files" }
     );
     let status_widget = Paragraph::new(status)
         .style(Style::default().fg(Color::DarkGray))
@@ -2159,7 +2297,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
     } else {
         Line::from(vec![
             Span::styled("Enter", Style::default().fg(Color::Cyan)),
-            Span::raw(" open  "),
+            Span::raw(if app.dir_mode { " open dir  " } else { " open  " }),
             Span::styled("^D", Style::default().fg(Color::Yellow)),
             Span::raw(" drag  "),
             Span::styled("Esc", Style::default().fg(Color::Cyan)),
@@ -2690,6 +2828,7 @@ fn drag_file(path: &str) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     unsafe {
         Command::new("ripdrag")
+            .args(["-i", "-s", "96", "-W", "96", "-H", "96", "-x"])
             .arg(path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2716,6 +2855,7 @@ fn main() -> io::Result<()> {
         return run_bench_flicker();
     }
     let drag_mode = args.iter().any(|arg| arg == "--drag");
+    let dir_mode = args.iter().any(|arg| arg == "--dir");
 
     // Setup terminal
     enable_raw_mode()?;
@@ -2724,7 +2864,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(dir_mode);
     app.drag_mode = drag_mode;
     let mut chosen: Option<ExitAction> = None;
 

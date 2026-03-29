@@ -12,6 +12,7 @@ ffp searches only your recent files with no cache, so you can select recently up
 - Image preview (PNG, JPEG, GIF, WebP) via Kitty graphics protocol
 - Text file preview
 - Files sorted by modification time (most recent first)
+- File discovery scoped to files changed within the last 9 days
 - LRU thumbnail cache for fast image switching
 
 ## Performance
@@ -49,6 +50,7 @@ profile: hot cache access in 632ns
 
 ```bash
 ffp              # Launch file picker
+ffp --dir        # Launch directory picker
 ffp --profile    # Run performance profiler
 ```
 
