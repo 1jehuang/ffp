@@ -64,7 +64,7 @@ ffp --profile    # Run performance profiler
 | `↑/↓` | Navigate |
 | `Ctrl+N/J` | Next item |
 | `Ctrl+P/K` | Previous item |
-| `z` | Toggle between recent-only and all-files search |
+| `Ctrl+Z` | Toggle between recent-only and all-files search |
 | `Ctrl+U` | Clear query |
 | `Ctrl+W` | Delete word |
 

@@ -2633,7 +2633,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         file_count,
         if app.dir_mode { "dirs" } else { "files" },
         active_scope.label(),
-        if app.dir_mode { "" } else { " | z toggle" }
+        if app.dir_mode { "" } else { " | ^Z toggle" }
     );
     let status_widget = Paragraph::new(status)
         .style(Style::default().fg(Color::DarkGray))
@@ -3456,7 +3456,7 @@ fn main() -> io::Result<()> {
                                 .spawn();
                         }
                     }
-                    (KeyCode::Char('z'), KeyModifiers::NONE) => {
+                    (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                         app.toggle_search_scope();
                     }
                     (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
