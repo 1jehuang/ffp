@@ -12,7 +12,8 @@ ffp searches only your recent files with no cache, so you can select recently up
 - Image preview (PNG, JPEG, GIF, WebP) via Kitty graphics protocol
 - Text file preview
 - Files sorted by modification time (most recent first)
-- File discovery scoped to files changed within the last 9 days
+- File discovery defaults to files changed within the last 9 days
+- Press `z` to toggle between recent files and all files
 - LRU thumbnail cache for fast image switching
 
 ## Performance
@@ -63,6 +64,7 @@ ffp --profile    # Run performance profiler
 | `↑/↓` | Navigate |
 | `Ctrl+N/J` | Next item |
 | `Ctrl+P/K` | Previous item |
+| `z` | Toggle between recent-only and all-files search |
 | `Ctrl+U` | Clear query |
 | `Ctrl+W` | Delete word |
 

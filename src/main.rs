@@ -14,14 +14,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
 use std::{
     cmp::Ordering,
     collections::HashMap,
-    env,
-    fs,
+    env, fs,
     io::{self, BufRead, BufReader, Write},
     os::unix::fs::FileTypeExt,
     path::Path,
@@ -30,6 +26,9 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 
 const MATCH_LIMIT: usize = 50;
 const FILE_BATCH_SIZE: usize = 256;
@@ -116,18 +115,45 @@ enum PreviewContent {
 enum ExitAction {
     Open(String),
     Drag(String),
+    Choose(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchScope {
+    Recent,
+    All,
+}
+
+impl SearchScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::All => "all",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Recent => Self::All,
+            Self::All => Self::Recent,
+        }
+    }
 }
 
 struct App {
     query: String,
-    files: Arc<Mutex<Vec<FileEntry>>>,
+    recent_files: Arc<Mutex<Vec<FileEntry>>>,
+    all_files: Arc<Mutex<Vec<FileEntry>>>,
     matches: Vec<MatchEntry>,
     matches_by_time: Vec<MatchEntry>,
     selected: usize,
     active_column: usize, // 0 = ranked, 1 = recent
-    loading: Arc<Mutex<bool>>,
+    recent_loading: Arc<Mutex<bool>>,
+    all_loading: Arc<Mutex<bool>>,
+    search_scope: SearchScope,
     last_query: String,
     last_file_count: usize,
+    last_scope: SearchScope,
     preview_path: String,
     preview_content: PreviewContent,
     image_cache: ImageCache,
@@ -146,15 +172,31 @@ struct App {
 
 impl App {
     fn new(dir_mode: bool) -> Self {
-        let files = Arc::new(Mutex::new(Vec::new()));
-        let loading = Arc::new(Mutex::new(true));
+        let recent_files = Arc::new(Mutex::new(Vec::new()));
+        let all_files = Arc::new(Mutex::new(Vec::new()));
+        let recent_loading = Arc::new(Mutex::new(false));
+        let all_loading = Arc::new(Mutex::new(false));
+        let search_scope = if dir_mode {
+            SearchScope::All
+        } else {
+            SearchScope::Recent
+        };
 
-        // Spawn file loader thread
-        let files_clone = Arc::clone(&files);
-        let loading_clone = Arc::clone(&loading);
-        thread::spawn(move || {
-            load_entries(files_clone, loading_clone, dir_mode);
-        });
+        if dir_mode {
+            spawn_entry_loader(
+                Arc::clone(&all_files),
+                Arc::clone(&all_loading),
+                dir_mode,
+                false,
+            );
+        } else {
+            spawn_entry_loader(
+                Arc::clone(&recent_files),
+                Arc::clone(&recent_loading),
+                dir_mode,
+                true,
+            );
+        }
 
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let mut ts = ThemeSet::load_defaults();
@@ -162,14 +204,18 @@ impl App {
 
         Self {
             query: String::new(),
-            files,
+            recent_files,
+            all_files,
             matches: Vec::new(),
             matches_by_time: Vec::new(),
             selected: 0,
             active_column: 0,
-            loading,
+            recent_loading,
+            all_loading,
+            search_scope,
             last_query: String::new(),
             last_file_count: 0,
+            last_scope: search_scope,
             preview_path: String::new(),
             preview_content: PreviewContent::None,
             image_cache: LruCache::new(IMAGE_CACHE_SIZE),
@@ -187,6 +233,51 @@ impl App {
         }
     }
 
+    fn files_for_scope(&self, scope: SearchScope) -> &Arc<Mutex<Vec<FileEntry>>> {
+        match scope {
+            SearchScope::Recent => &self.recent_files,
+            SearchScope::All => &self.all_files,
+        }
+    }
+
+    fn loading_for_scope(&self, scope: SearchScope) -> &Arc<Mutex<bool>> {
+        match scope {
+            SearchScope::Recent => &self.recent_loading,
+            SearchScope::All => &self.all_loading,
+        }
+    }
+
+    fn active_scope(&self) -> SearchScope {
+        if self.dir_mode {
+            SearchScope::All
+        } else {
+            self.search_scope
+        }
+    }
+
+    fn toggle_search_scope(&mut self) {
+        if self.dir_mode {
+            return;
+        }
+
+        self.search_scope = self.search_scope.toggle();
+        self.selected = 0;
+        self.preview_path.clear();
+
+        if self.search_scope == SearchScope::All {
+            let needs_load = self.all_files.lock().unwrap().is_empty();
+            let is_loading = *self.all_loading.lock().unwrap();
+            if needs_load && !is_loading {
+                spawn_entry_loader(
+                    Arc::clone(&self.all_files),
+                    Arc::clone(&self.all_loading),
+                    self.dir_mode,
+                    false,
+                );
+            }
+        }
+    }
+
     fn update_preview(&mut self) {
         // Drain any pending PNG-compressed frames into the cache
         if let Some((path, frames)) = self.video_cache_pending.lock().unwrap().take() {
@@ -198,8 +289,11 @@ impl App {
             // Check if streaming video has new frames
             if let Some(ref loader) = self.video_loader {
                 let frames = loader.lock().unwrap();
-                let done = self.video_loader_done.as_ref()
-                    .map(|d| *d.lock().unwrap()).unwrap_or(false);
+                let done = self
+                    .video_loader_done
+                    .as_ref()
+                    .map(|d| *d.lock().unwrap())
+                    .unwrap_or(false);
                 if !frames.is_empty() {
                     let new_frames = frames.clone();
                     drop(frames);
@@ -208,18 +302,31 @@ impl App {
                         let frames_for_cache = new_frames.clone();
                         let cache = Arc::clone(&self.video_cache_pending);
                         thread::spawn(move || {
-                            let png_frames: Vec<CachedImage> = frames_for_cache.iter().filter_map(|f| {
-                                if f.is_raw_rgb {
-                                    let img = image::RgbImage::from_raw(f.width, f.height, f.data.clone())?;
-                                    let mut buf = Vec::new();
-                                    let mut cursor = std::io::Cursor::new(&mut buf);
-                                    image::DynamicImage::ImageRgb8(img)
-                                        .write_to(&mut cursor, image::ImageFormat::Png).ok()?;
-                                    Some(CachedImage { data: buf, width: f.width, height: f.height, is_raw_rgb: false })
-                                } else {
-                                    Some(f.clone())
-                                }
-                            }).collect();
+                            let png_frames: Vec<CachedImage> = frames_for_cache
+                                .iter()
+                                .filter_map(|f| {
+                                    if f.is_raw_rgb {
+                                        let img = image::RgbImage::from_raw(
+                                            f.width,
+                                            f.height,
+                                            f.data.clone(),
+                                        )?;
+                                        let mut buf = Vec::new();
+                                        let mut cursor = std::io::Cursor::new(&mut buf);
+                                        image::DynamicImage::ImageRgb8(img)
+                                            .write_to(&mut cursor, image::ImageFormat::Png)
+                                            .ok()?;
+                                        Some(CachedImage {
+                                            data: buf,
+                                            width: f.width,
+                                            height: f.height,
+                                            is_raw_rgb: false,
+                                        })
+                                    } else {
+                                        Some(f.clone())
+                                    }
+                                })
+                                .collect();
                             cache.lock().unwrap().replace((cache_path, png_frames));
                         });
                         self.video_loader = None;
@@ -232,9 +339,10 @@ impl App {
                     drop(frames);
                     self.video_loader = None;
                     self.video_loader_done = None;
-                    self.preview_content = PreviewContent::Text(vec![
-                        Line::from(Span::styled("[Cannot load video]", Style::default().fg(Color::DarkGray)))
-                    ]);
+                    self.preview_content = PreviewContent::Text(vec![Line::from(Span::styled(
+                        "[Cannot load video]",
+                        Style::default().fg(Color::DarkGray),
+                    ))]);
                 }
             }
             return;
@@ -285,9 +393,10 @@ impl App {
                 self.image_cache.insert(current_path.clone(), img.clone());
                 self.preview_content = PreviewContent::Image(img);
             } else {
-                self.preview_content = PreviewContent::Text(vec![
-                    Line::from(Span::styled("[Cannot load image]", Style::default().fg(Color::DarkGray)))
-                ]);
+                self.preview_content = PreviewContent::Text(vec![Line::from(Span::styled(
+                    "[Cannot load image]",
+                    Style::default().fg(Color::DarkGray),
+                ))]);
             }
         } else {
             let lines = read_preview(&current_path, 40);
@@ -296,53 +405,63 @@ impl App {
                 .unwrap_or(false);
             // Error/info messages (single line starting with '[') stay plain
             if lines.len() == 1 && lines[0].starts_with('[') {
-                self.preview_content = PreviewContent::Text(vec![
-                    Line::from(Span::styled(lines[0].clone(), Style::default().fg(Color::DarkGray)))
-                ]);
+                self.preview_content = PreviewContent::Text(vec![Line::from(Span::styled(
+                    lines[0].clone(),
+                    Style::default().fg(Color::DarkGray),
+                ))]);
             } else if is_dir {
                 self.preview_content = PreviewContent::Text(plain_preview(lines));
             } else {
-                self.preview_content = PreviewContent::Text(
-                    highlight_preview(&lines, &current_path, &self.syntax_set, &self.theme)
-                );
+                self.preview_content = PreviewContent::Text(highlight_preview(
+                    &lines,
+                    &current_path,
+                    &self.syntax_set,
+                    &self.theme,
+                ));
             }
         }
     }
 
     fn update_matches(&mut self) {
-        let files = self.files.lock().unwrap();
-        let files_len = files.len();
+        let scope = self.active_scope();
+        let files_len = self.files_for_scope(scope).lock().unwrap().len();
         let query_changed = self.query != self.last_query;
         let files_changed = files_len != self.last_file_count;
+        let scope_changed = scope != self.last_scope;
 
-        if !query_changed && !files_changed {
+        if !query_changed && !files_changed && !scope_changed {
             return;
         }
 
-        self.matches = fuzzy_match(&self.query, &files, MATCH_LIMIT);
+        let (matches, matches_by_time) = {
+            let files = self.files_for_scope(scope).lock().unwrap();
+            let matches = fuzzy_match(&self.query, &files, MATCH_LIMIT);
 
-        // Time-sorted column: same matches, sorted by mtime then score
-        self.matches_by_time = self.matches.clone();
-        self.matches_by_time.sort_by(|a, b| {
-            files[b.index]
-                .mtime
-                .cmp(&files[a.index].mtime)
-                .then_with(|| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(Ordering::Equal)
-                })
-        });
+            // Time-sorted column: same matches, sorted by mtime then score
+            let mut matches_by_time = matches.clone();
+            matches_by_time.sort_by(|a, b| {
+                files[b.index]
+                    .mtime
+                    .cmp(&files[a.index].mtime)
+                    .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
+            });
+
+            (matches, matches_by_time)
+        };
+
+        self.matches = matches;
+        self.matches_by_time = matches_by_time;
 
         self.last_query = self.query.clone();
         self.last_file_count = files_len;
+        self.last_scope = scope;
         if self.selected >= self.matches.len() {
             self.selected = self.matches.len().saturating_sub(1);
         }
     }
 
     fn selected_file(&self) -> Option<String> {
-        let files = self.files.lock().unwrap();
+        let files = self.files_for_scope(self.active_scope()).lock().unwrap();
         let matches = if self.active_column == 0 {
             &self.matches
         } else {
@@ -363,11 +482,11 @@ impl App {
     }
 
     fn is_loading(&self) -> bool {
-        *self.loading.lock().unwrap()
+        *self.loading_for_scope(self.active_scope()).lock().unwrap()
     }
 }
 
-fn load_entries(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>, dir_mode: bool) {
+fn build_fd_args(dir_mode: bool, recent_only: bool) -> Vec<String> {
     let mut args = vec![
         ".".to_string(),
         dirs::home_dir().unwrap().to_string_lossy().to_string(),
@@ -376,7 +495,7 @@ fn load_entries(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>, di
         if dir_mode { "d" } else { "f" }.to_string(),
     ];
 
-    if !dir_mode {
+    if recent_only && !dir_mode {
         args.push("--changed-within".to_string());
         args.push(FILE_LOOKBACK_WINDOW.to_string());
     }
@@ -392,6 +511,31 @@ fn load_entries(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>, di
         "-E".to_string(),
         ".npm".to_string(),
     ]);
+
+    args
+}
+
+fn spawn_entry_loader(
+    files: Arc<Mutex<Vec<FileEntry>>>,
+    loading: Arc<Mutex<bool>>,
+    dir_mode: bool,
+    recent_only: bool,
+) {
+    *loading.lock().unwrap() = true;
+    files.lock().unwrap().clear();
+
+    thread::spawn(move || {
+        load_entries(files, loading, dir_mode, recent_only);
+    });
+}
+
+fn load_entries(
+    files: Arc<Mutex<Vec<FileEntry>>>,
+    loading: Arc<Mutex<bool>>,
+    dir_mode: bool,
+    recent_only: bool,
+) {
+    let args = build_fd_args(dir_mode, recent_only);
 
     let child = Command::new("fd")
         .args(&args)
@@ -435,7 +579,7 @@ fn load_entries(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>, di
 }
 
 fn load_files(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>) {
-    load_entries(files, loading, false);
+    load_entries(files, loading, false, true);
 }
 
 fn basename(path: &str) -> &str {
@@ -583,7 +727,10 @@ fn is_image_file(path: &str) -> bool {
         .unwrap_or("")
         .to_lowercase();
 
-    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico")
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
+    )
 }
 
 fn is_video_file(path: &str) -> bool {
@@ -593,15 +740,21 @@ fn is_video_file(path: &str) -> bool {
         .unwrap_or("")
         .to_lowercase();
 
-    matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v")
+    matches!(
+        ext.as_str(),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v"
+    )
 }
 
 fn get_video_duration(path: &str) -> Option<f64> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "quiet",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0",
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
             path,
         ])
         .stdout(Stdio::piped())
@@ -615,10 +768,14 @@ fn get_video_duration(path: &str) -> Option<f64> {
 fn get_video_dimensions(path: &str) -> Option<(u32, u32)> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "quiet",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0:s=x",
+            "-v",
+            "quiet",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
             path,
         ])
         .stdout(Stdio::piped())
@@ -637,21 +794,17 @@ fn get_video_dimensions(path: &str) -> Option<(u32, u32)> {
 }
 
 fn compute_scaled_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    let scale = f64::min(
-        max_w as f64 / src_w as f64,
-        max_h as f64 / src_h as f64,
-    ).min(1.0);
+    let scale = f64::min(max_w as f64 / src_w as f64, max_h as f64 / src_h as f64).min(1.0);
     let w = ((src_w as f64 * scale) as u32) & !1; // even for ffmpeg
     let h = ((src_h as f64 * scale) as u32) & !1;
     (w.max(2), h.max(2))
 }
 
-
-
 fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
     let duration = get_video_duration(path).unwrap_or(5.0);
     let (src_w, src_h) = get_video_dimensions(path).unwrap_or((640, 480));
-    let (out_w, out_h) = compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+    let (out_w, out_h) =
+        compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
     let frame_size = (out_w * out_h * 3) as usize;
 
     let fps = (VIDEO_PREVIEW_FRAMES as f64 / duration).max(0.5);
@@ -662,16 +815,22 @@ fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
 
     let mut child = match Command::new("ffmpeg")
         .args([
-            "-i", path,
-            "-vf", &scale_filter,
-            "-frames:v", &VIDEO_PREVIEW_FRAMES.to_string(),
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
+            "-i",
+            path,
+            "-vf",
+            &scale_filter,
+            "-frames:v",
+            &VIDEO_PREVIEW_FRAMES.to_string(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
             "-",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn() {
+        .spawn()
+    {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -751,29 +910,22 @@ fn highlight_preview(
 
     lines
         .iter()
-        .map(|line| {
-            match h.highlight_line(line, ss) {
-                Ok(ranges) => {
-                    let spans: Vec<Span<'static>> = ranges
-                        .into_iter()
-                        .map(|(style, text)| {
-                            let fg = Color::Rgb(
-                                style.foreground.r,
-                                style.foreground.g,
-                                style.foreground.b,
-                            );
-                            Span::styled(text.to_string(), Style::default().fg(fg))
-                        })
-                        .collect();
-                    Line::from(spans)
-                }
-                Err(_) => {
-                    Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::Gray),
-                    ))
-                }
+        .map(|line| match h.highlight_line(line, ss) {
+            Ok(ranges) => {
+                let spans: Vec<Span<'static>> = ranges
+                    .into_iter()
+                    .map(|(style, text)| {
+                        let fg =
+                            Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                        Span::styled(text.to_string(), Style::default().fg(fg))
+                    })
+                    .collect();
+                Line::from(spans)
             }
+            Err(_) => Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::Gray),
+            )),
         })
         .collect()
 }
@@ -798,7 +950,9 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
     // Encode to PNG for kitty protocol
     let mut png_data = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut png_data);
-    thumbnail.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+    thumbnail
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .ok()?;
 
     Some(CachedImage {
         data: png_data,
@@ -889,7 +1043,8 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
                 write!(
                     out,
                     "\x1b_Ga=T,q=2,i=1,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
-                    img.width, img.height,
+                    img.width,
+                    img.height,
                     cols,
                     rows,
                     if is_last { 0 } else { 1 },
@@ -1017,15 +1172,19 @@ fn get_icon(filename: &str) -> (&'static str, Color) {
         "dockerfile" => ("\u{e7b0}", Color::Rgb(56, 134, 200)),
         "lock" => ("\u{f023}", Color::DarkGray),
         // Media
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" | "tiff"
-            => ("\u{f1c5}", Color::Rgb(160, 100, 210)),
-        "mp3" | "wav" | "flac" | "ogg" | "aac" | "m4a" | "wma"
-            => ("\u{f1c7}", Color::Rgb(255, 87, 51)),
-        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v"
-            => ("\u{f1c8}", Color::Rgb(253, 216, 53)),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" | "tiff" => {
+            ("\u{f1c5}", Color::Rgb(160, 100, 210))
+        }
+        "mp3" | "wav" | "flac" | "ogg" | "aac" | "m4a" | "wma" => {
+            ("\u{f1c7}", Color::Rgb(255, 87, 51))
+        }
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v" => {
+            ("\u{f1c8}", Color::Rgb(253, 216, 53))
+        }
         // Archives
-        "zip" | "tar" | "gz" | "xz" | "bz2" | "7z" | "rar" | "zst" | "deb" | "rpm"
-            => ("\u{f1c6}", Color::Rgb(175, 135, 0)),
+        "zip" | "tar" | "gz" | "xz" | "bz2" | "7z" | "rar" | "zst" | "deb" | "rpm" => {
+            ("\u{f1c6}", Color::Rgb(175, 135, 0))
+        }
         // Fonts
         "ttf" | "otf" | "woff" | "woff2" => ("\u{f031}", Color::White),
         // Misc
@@ -1065,18 +1224,12 @@ fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry
 
     if results.len() > limit {
         results.select_nth_unstable_by(limit, |a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(Ordering::Equal)
+            b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
         });
         results.truncate(limit);
     }
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(Ordering::Equal)
-    });
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     results
 }
 
@@ -1266,7 +1419,10 @@ fn run_profile() -> io::Result<()> {
 
     let files = files.lock().unwrap();
     let file_count = files.len();
-    eprintln!("profile: loaded {} files in {:?}", file_count, load_duration);
+    eprintln!(
+        "profile: loaded {} files in {:?}",
+        file_count, load_duration
+    );
 
     let empty_start = Instant::now();
     let empty_matches = fuzzy_match("", &files, MATCH_LIMIT);
@@ -1290,7 +1446,8 @@ fn run_profile() -> io::Result<()> {
 
     // Profile image loading
     eprintln!("\n=== Image Loading Profile ===");
-    let image_files: Vec<_> = files.iter()
+    let image_files: Vec<_> = files
+        .iter()
         .filter(|f| is_image_file(&f.path))
         .take(5)
         .collect();
@@ -1336,14 +1493,18 @@ fn run_profile() -> io::Result<()> {
                 let start = Instant::now();
                 let _ = cache.get(&first.path);
                 let cache_time = start.elapsed();
-                eprintln!("profile: hot cache access {:?} in {:?}", first.name, cache_time);
+                eprintln!(
+                    "profile: hot cache access {:?} in {:?}",
+                    first.name, cache_time
+                );
             }
         }
     }
 
     // Profile video loading
     eprintln!("\n=== Video Loading Profile ===");
-    let video_files: Vec<_> = files.iter()
+    let video_files: Vec<_> = files
+        .iter()
         .filter(|f| is_video_file(&f.path))
         .take(3)
         .collect();
@@ -1359,10 +1520,15 @@ fn run_profile() -> io::Result<()> {
                 eprintln!("  duration: {:.1}s", dur);
             }
             if let Some((w, h)) = get_video_dimensions(&file.path) {
-                let (sw, sh) = compute_scaled_dimensions(w, h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+                let (sw, sh) =
+                    compute_scaled_dimensions(w, h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
                 eprintln!("  source: {}x{} -> scaled: {}x{}", w, h, sw, sh);
                 let frame_bytes = sw as usize * sh as usize * 3;
-                eprintln!("  raw frame size: {} bytes ({:.1} KiB)", frame_bytes, frame_bytes as f64 / 1024.0);
+                eprintln!(
+                    "  raw frame size: {} bytes ({:.1} KiB)",
+                    frame_bytes,
+                    frame_bytes as f64 / 1024.0
+                );
             }
 
             // Measure RSS before
@@ -1399,7 +1565,11 @@ fn run_profile() -> io::Result<()> {
             let frames = shared.lock().unwrap();
             let frame_count = frames.len();
             let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
-            let avg_frame = if frame_count > 0 { total_bytes / frame_count } else { 0 };
+            let avg_frame = if frame_count > 0 {
+                total_bytes / frame_count
+            } else {
+                0
+            };
 
             // Measure RSS after
             let rss_after = get_rss_kb();
@@ -1408,12 +1578,18 @@ fn run_profile() -> io::Result<()> {
             if frame_count > 0 {
                 let fps = frame_count as f64 / total_time.as_secs_f64();
                 eprintln!("  extraction rate: {:.1} frames/sec", fps);
-                eprintln!("  frame data: {:.1} KiB avg, {:.1} MiB total",
+                eprintln!(
+                    "  frame data: {:.1} KiB avg, {:.1} MiB total",
                     avg_frame as f64 / 1024.0,
-                    total_bytes as f64 / (1024.0 * 1024.0));
+                    total_bytes as f64 / (1024.0 * 1024.0)
+                );
             }
-            eprintln!("  RSS: {} KiB -> {} KiB (delta: {} KiB)",
-                rss_before, rss_after, rss_after.saturating_sub(rss_before));
+            eprintln!(
+                "  RSS: {} KiB -> {} KiB (delta: {} KiB)",
+                rss_before,
+                rss_after,
+                rss_after.saturating_sub(rss_before)
+            );
         }
 
         // Profile video cache hit
@@ -1429,7 +1605,12 @@ fn run_profile() -> io::Result<()> {
             let frames = Arc::try_unwrap(shared).unwrap().into_inner().unwrap();
             let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
             vcache.insert(first.path.clone(), frames);
-            eprintln!("  cold load {:?}: {:?} ({:.1} MiB)", first.name, cold, total_bytes as f64 / (1024.0 * 1024.0));
+            eprintln!(
+                "  cold load {:?}: {:?} ({:.1} MiB)",
+                first.name,
+                cold,
+                total_bytes as f64 / (1024.0 * 1024.0)
+            );
 
             let start = Instant::now();
             let _ = vcache.get(&first.path);
@@ -1450,7 +1631,12 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("ffp-test-{}-{}-{}", std::process::id(), nanos, name))
+        std::env::temp_dir().join(format!(
+            "ffp-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            name
+        ))
     }
 
     #[test]
@@ -1483,6 +1669,20 @@ mod tests {
         let matches = fuzzy_match("résumé", &files, 10);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].index, 0);
+    }
+
+    #[test]
+    fn build_fd_args_uses_lookback_only_for_recent_file_search() {
+        let recent_args = build_fd_args(false, true);
+        assert!(recent_args.iter().any(|arg| arg == "--changed-within"));
+        assert!(recent_args.iter().any(|arg| arg == FILE_LOOKBACK_WINDOW));
+
+        let all_args = build_fd_args(false, false);
+        assert!(!all_args.iter().any(|arg| arg == "--changed-within"));
+        assert!(!all_args.iter().any(|arg| arg == FILE_LOOKBACK_WINDOW));
+
+        let dir_args = build_fd_args(true, true);
+        assert!(!dir_args.iter().any(|arg| arg == "--changed-within"));
     }
 
     #[test]
@@ -1538,7 +1738,7 @@ mod tests {
     }
 
     fn get_kitty_header(cmd: &str) -> &str {
-        let inner = &cmd[2..cmd.len() - 2]; // strip \x1b_ and \x1b\ 
+        let inner = &cmd[2..cmd.len() - 2]; // strip \x1b_ and \x1b\
         if let Some(pos) = inner.find(';') {
             &inner[..pos]
         } else {
@@ -1554,7 +1754,12 @@ mod tests {
             height: 100,
             is_raw_rgb: false,
         };
-        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+        };
         let mut buf = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
@@ -1564,8 +1769,14 @@ mod tests {
 
         let header = get_kitty_header(&cmds[0]);
         assert!(header.contains("a=T"), "action should be transmit+display");
-        assert!(header.contains("q=2"), "must have quiet mode to suppress responses");
-        assert!(header.contains("i=1"), "must use image ID 1 for atomic replacement");
+        assert!(
+            header.contains("q=2"),
+            "must have quiet mode to suppress responses"
+        );
+        assert!(
+            header.contains("i=1"),
+            "must use image ID 1 for atomic replacement"
+        );
         assert!(header.contains("f=100"), "PNG data must use f=100");
         assert!(!header.contains("f=24"), "PNG data must not use f=24");
     }
@@ -1580,7 +1791,12 @@ mod tests {
             height: h,
             is_raw_rgb: true,
         };
-        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+        };
         let mut buf = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
@@ -1590,8 +1806,14 @@ mod tests {
 
         let header = get_kitty_header(&cmds[0]);
         assert!(header.contains("f=24"), "raw RGB must use f=24");
-        assert!(header.contains(&format!("s={}", w)), "must specify pixel width");
-        assert!(header.contains(&format!("v={}", h)), "must specify pixel height");
+        assert!(
+            header.contains(&format!("s={}", w)),
+            "must specify pixel width"
+        );
+        assert!(
+            header.contains(&format!("v={}", h)),
+            "must specify pixel height"
+        );
         assert!(header.contains("q=2"), "must have quiet mode");
         assert!(header.contains("i=1"), "must use image ID 1");
     }
@@ -1604,25 +1826,43 @@ mod tests {
             height: 50,
             is_raw_rgb: false,
         };
-        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
         let mut buf = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         let cmds = parse_kitty_commands(&output);
-        assert!(cmds.len() >= 2, "8KB data should produce multiple chunks, got {}", cmds.len());
+        assert!(
+            cmds.len() >= 2,
+            "8KB data should produce multiple chunks, got {}",
+            cmds.len()
+        );
 
         let first_header = get_kitty_header(&cmds[0]);
-        assert!(first_header.contains("m=1"), "first chunk must signal more data (m=1)");
+        assert!(
+            first_header.contains("m=1"),
+            "first chunk must signal more data (m=1)"
+        );
 
         for cmd in &cmds[1..cmds.len() - 1] {
             let h = get_kitty_header(cmd);
             assert!(h.contains("m=1"), "middle chunk must have m=1");
-            assert!(!h.contains("a="), "continuation chunks should not have action key");
+            assert!(
+                !h.contains("a="),
+                "continuation chunks should not have action key"
+            );
         }
 
         let last_header = get_kitty_header(cmds.last().unwrap());
-        assert!(last_header.contains("m=0"), "last chunk must signal end (m=0)");
+        assert!(
+            last_header.contains("m=0"),
+            "last chunk must signal end (m=0)"
+        );
     }
 
     #[test]
@@ -1633,17 +1873,29 @@ mod tests {
             height: 10,
             is_raw_rgb: false,
         };
-        let area = Rect { x: 5, y: 5, width: 20, height: 10 };
+        let area = Rect {
+            x: 5,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
         let mut buf = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
-        assert!(output.find("\x1b[?25l").is_none(),
-            "render_kitty_image_to must NOT hide cursor");
-        assert!(output.find("\x1b[?25h").is_none(),
-            "render_kitty_image_to must NOT show cursor");
+        assert!(
+            output.find("\x1b[?25l").is_none(),
+            "render_kitty_image_to must NOT hide cursor"
+        );
+        assert!(
+            output.find("\x1b[?25h").is_none(),
+            "render_kitty_image_to must NOT show cursor"
+        );
 
-        assert!(output.find("\x1b_G").is_some(), "should still have kitty command");
+        assert!(
+            output.find("\x1b_G").is_some(),
+            "should still have kitty command"
+        );
     }
 
     #[test]
@@ -1654,16 +1906,28 @@ mod tests {
             height: 50,
             is_raw_rgb: false,
         };
-        let area = Rect { x: 5, y: 5, width: 20, height: 10 };
+        let area = Rect {
+            x: 5,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
         let mut buf: Vec<u8> = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
-        assert!(!output.contains("\x1b[?25l"),
-            "kitty render must never hide cursor — no cursor toggling at all");
-        assert!(!output.contains("\x1b[?25h"),
-            "kitty render must never show cursor — no cursor toggling at all");
-        assert!(output.contains("\x1b_G"), "must contain kitty graphics command");
+        assert!(
+            !output.contains("\x1b[?25l"),
+            "kitty render must never hide cursor — no cursor toggling at all"
+        );
+        assert!(
+            !output.contains("\x1b[?25h"),
+            "kitty render must never show cursor — no cursor toggling at all"
+        );
+        assert!(
+            output.contains("\x1b_G"),
+            "must contain kitty graphics command"
+        );
     }
 
     #[test]
@@ -1687,7 +1951,12 @@ mod tests {
             height: 50,
             is_raw_rgb: false,
         };
-        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
         let mut buf = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
@@ -1696,8 +1965,11 @@ mod tests {
         for cmd in &cmds {
             let header = get_kitty_header(cmd);
             if header.contains("a=") {
-                assert!(header.contains("q=2"),
-                    "every command with an action must have q=2 to prevent stdin spam: {}", header);
+                assert!(
+                    header.contains("q=2"),
+                    "every command with an action must have q=2 to prevent stdin spam: {}",
+                    header
+                );
             }
         }
     }
@@ -1710,7 +1982,12 @@ mod tests {
             height: 1080,
             is_raw_rgb: false,
         };
-        let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+        };
         let mut buf = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
@@ -1718,11 +1995,13 @@ mod tests {
         let cmds = parse_kitty_commands(&output);
         let header = get_kitty_header(&cmds[0]);
 
-        let c_val: u32 = header.split(',')
+        let c_val: u32 = header
+            .split(',')
             .find(|s| s.starts_with("c="))
             .and_then(|s| s[2..].parse().ok())
             .expect("must have c= columns");
-        let r_val: u32 = header.split(',')
+        let r_val: u32 = header
+            .split(',')
             .find(|s| s.starts_with("r="))
             .and_then(|s| s[2..].parse().ok())
             .expect("must have r= rows");
@@ -1734,8 +2013,15 @@ mod tests {
         let display_ratio = c_val as f64 / r_val as f64;
         let expected_ratio = (1920.0 / 1080.0) * 2.0; // cell_ratio=2
         let diff = (display_ratio - expected_ratio).abs() / expected_ratio;
-        assert!(diff < 0.15, "aspect ratio off by {:.0}%: display {}/{} = {:.2}, expected {:.2}",
-            diff * 100.0, c_val, r_val, display_ratio, expected_ratio);
+        assert!(
+            diff < 0.15,
+            "aspect ratio off by {:.0}%: display {}/{} = {:.2}, expected {:.2}",
+            diff * 100.0,
+            c_val,
+            r_val,
+            display_ratio,
+            expected_ratio
+        );
     }
 
     // --- Video render decision tests (flicker bugs) ---
@@ -1750,11 +2036,15 @@ mod tests {
             Duration::from_millis(0), // just started, no time elapsed
             &mut frame,
             &mut time,
-            10,                      // 10 frames available
-            "/videos/test.mp4",      // current path
-            "",                      // last_rendered_path is empty (nothing rendered yet)
+            10,                 // 10 frames available
+            "/videos/test.mp4", // current path
+            "",                 // last_rendered_path is empty (nothing rendered yet)
         );
-        assert_eq!(result, Some(0), "first frame of a new video must always render");
+        assert_eq!(
+            result,
+            Some(0),
+            "first frame of a new video must always render"
+        );
     }
 
     #[test]
@@ -1769,9 +2059,12 @@ mod tests {
             &mut time,
             10,
             "/videos/test.mp4",
-            "/videos/test.mp4",        // same path = already rendered
+            "/videos/test.mp4", // same path = already rendered
         );
-        assert_eq!(result, None, "should skip render when frame unchanged and path matches");
+        assert_eq!(
+            result, None,
+            "should skip render when frame unchanged and path matches"
+        );
         assert_eq!(frame, 3, "frame index should not change");
     }
 
@@ -1819,9 +2112,9 @@ mod tests {
             Duration::from_millis(0), // no time elapsed
             &mut frame,
             &mut time,
-            5,                        // only 5 frames now
+            5, // only 5 frames now
             "/videos/test.mp4",
-            "/videos/test.mp4",       // same path
+            "/videos/test.mp4", // same path
         );
         assert_eq!(result, Some(0), "must clamp out-of-bounds frame and render");
         assert_eq!(frame, 0);
@@ -1835,7 +2128,7 @@ mod tests {
             Duration::from_millis(100),
             &mut frame,
             &mut time,
-            0,                        // no frames yet
+            0, // no frames yet
             "/videos/test.mp4",
             "",
         );
@@ -1853,8 +2146,8 @@ mod tests {
             &mut frame,
             &mut time,
             10,
-            "/videos/new.mp4",        // new video
-            "/videos/old.mp4",        // was showing old video
+            "/videos/new.mp4", // new video
+            "/videos/old.mp4", // was showing old video
         );
         assert_eq!(result, Some(0), "path change must trigger render");
     }
@@ -1881,14 +2174,8 @@ mod tests {
                 Duration::from_millis((cycle - (render_count.max(1) - 1) * 4) as u64 * 16)
             };
 
-            let result = video_render_decision(
-                fake_elapsed,
-                &mut frame,
-                &mut time,
-                10,
-                path,
-                &last_path,
-            );
+            let result =
+                video_render_decision(fake_elapsed, &mut frame, &mut time, 10, path, &last_path);
 
             if let Some(_idx) = result {
                 render_count += 1;
@@ -1898,9 +2185,13 @@ mod tests {
                 gap += 1;
                 // If we haven't rendered in 5+ cycles (80ms), that's a flicker bug.
                 // At 66ms interval, max gap should be ~4 cycles.
-                assert!(gap <= 5,
+                assert!(
+                    gap <= 5,
                     "flicker detected: {} consecutive skipped renders at cycle {} (frame {})",
-                    gap, cycle, frame);
+                    gap,
+                    cycle,
+                    frame
+                );
             }
         }
 
@@ -1915,27 +2206,43 @@ mod tests {
             height: 100,
             is_raw_rgb: false,
         };
-        let area = Rect { x: 50, y: 5, width: 40, height: 20 };
+        let area = Rect {
+            x: 50,
+            y: 5,
+            width: 40,
+            height: 20,
+        };
 
         let mut buf = Vec::new();
         render_kitty_image_to(&img, area, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
-        assert!(!output.contains("\x1b[?25h"),
-            "kitty render must never make cursor visible");
-        assert!(!output.contains("\x1b[?25l"),
-            "kitty render must never hide cursor either — no toggling at all");
+        assert!(
+            !output.contains("\x1b[?25h"),
+            "kitty render must never make cursor visible"
+        );
+        assert!(
+            !output.contains("\x1b[?25l"),
+            "kitty render must never hide cursor either — no toggling at all"
+        );
     }
 
     #[test]
     fn video_rapid_frames_no_cursor_leak() {
-        let frames: Vec<CachedImage> = (0..5).map(|i| CachedImage {
-            data: vec![i as u8; 50],
-            width: 10,
-            height: 10,
-            is_raw_rgb: false,
-        }).collect();
-        let area = Rect { x: 50, y: 5, width: 40, height: 20 };
+        let frames: Vec<CachedImage> = (0..5)
+            .map(|i| CachedImage {
+                data: vec![i as u8; 50],
+                width: 10,
+                height: 10,
+                is_raw_rgb: false,
+            })
+            .collect();
+        let area = Rect {
+            x: 50,
+            y: 5,
+            width: 40,
+            height: 20,
+        };
 
         let mut combined = Vec::new();
         for frame in &frames {
@@ -1943,26 +2250,35 @@ mod tests {
         }
         let output = String::from_utf8_lossy(&combined);
 
-        assert!(!output.contains("\x1b[?25l"),
-            "kitty render must never hide cursor");
-        assert!(!output.contains("\x1b[?25h"),
-            "kitty render must never show cursor");
+        assert!(
+            !output.contains("\x1b[?25l"),
+            "kitty render must never hide cursor"
+        );
+        assert!(
+            !output.contains("\x1b[?25h"),
+            "kitty render must never show cursor"
+        );
 
         let kitty_count = output.matches("\x1b_G").count();
-        assert!(kitty_count >= 5,
-            "should have at least 5 kitty commands (one per frame), got {}", kitty_count);
+        assert!(
+            kitty_count >= 5,
+            "should have at least 5 kitty commands (one per frame), got {}",
+            kitty_count
+        );
     }
 
     #[test]
     fn video_preview_text_stable_across_frames() {
         use std::collections::HashSet;
 
-        let frames: Vec<CachedImage> = (0..10).map(|i| CachedImage {
-            data: vec![i; 100],
-            width: 40,
-            height: 30,
-            is_raw_rgb: false,
-        }).collect();
+        let frames: Vec<CachedImage> = (0..10)
+            .map(|i| CachedImage {
+                data: vec![i; 100],
+                width: 40,
+                height: 30,
+                is_raw_rgb: false,
+            })
+            .collect();
 
         let mut seen_lines: HashSet<String> = HashSet::new();
         for video_frame in 0..10 {
@@ -1973,7 +2289,8 @@ mod tests {
                 ))],
                 _ => vec![],
             };
-            let text: String = preview_lines.iter()
+            let text: String = preview_lines
+                .iter()
                 .map(|l| l.to_string())
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -1981,10 +2298,15 @@ mod tests {
             let _ = video_frame;
         }
 
-        assert_eq!(seen_lines.len(), 1,
+        assert_eq!(
+            seen_lines.len(),
+            1,
             "preview text must be identical across all video frames to prevent \
              ratatui diff-redraws that flash text under the kitty image. \
-             Got {} different texts: {:?}", seen_lines.len(), seen_lines);
+             Got {} different texts: {:?}",
+            seen_lines.len(),
+            seen_lines
+        );
     }
 
     /// End-to-end render loop simulation.
@@ -2008,13 +2330,20 @@ mod tests {
     ///    position.
     #[test]
     fn end_to_end_render_loop_no_flicker() {
-        let frames: Vec<CachedImage> = (0..10).map(|i| CachedImage {
-            data: vec![i as u8; 200],
-            width: 40,
-            height: 30,
-            is_raw_rgb: false,
-        }).collect();
-        let area = Rect { x: 60, y: 2, width: 50, height: 25 };
+        let frames: Vec<CachedImage> = (0..10)
+            .map(|i| CachedImage {
+                data: vec![i as u8; 200],
+                width: 40,
+                height: 30,
+                is_raw_rgb: false,
+            })
+            .collect();
+        let area = Rect {
+            x: 60,
+            y: 2,
+            width: 50,
+            height: 25,
+        };
         let cursor_input = (15u16, 1u16);
 
         let mut terminal_bytes: Vec<u8> = Vec::new();
@@ -2024,7 +2353,13 @@ mod tests {
         let preview_path = "/test/video.mp4";
 
         for cycle in 0..30 {
-            write!(terminal_bytes, "\x1b[{};{}H", cursor_input.1 + 1, cursor_input.0 + 1).unwrap();
+            write!(
+                terminal_bytes,
+                "\x1b[{};{}H",
+                cursor_input.1 + 1,
+                cursor_input.0 + 1
+            )
+            .unwrap();
             write!(terminal_bytes, "\x1b[?25h").unwrap();
 
             let elapsed = Duration::from_millis(cycle * 20);
@@ -2048,9 +2383,8 @@ mod tests {
 
         let output = String::from_utf8_lossy(&terminal_bytes).to_string();
 
-        let kitty_positions: Vec<usize> = output.match_indices("\x1b_G")
-            .map(|(pos, _)| pos)
-            .collect();
+        let kitty_positions: Vec<usize> =
+            output.match_indices("\x1b_G").map(|(pos, _)| pos).collect();
 
         for &kpos in &kitty_positions {
             let before = &output[..kpos];
@@ -2059,16 +2393,25 @@ mod tests {
 
             if let Some(show_pos) = last_show {
                 if let Some(hide_pos) = last_hide {
-                    assert!(show_pos > hide_pos || true,
+                    assert!(
+                        show_pos > hide_pos || true,
                         "cursor state tracking: show at {}, hide at {} before kitty at {}",
-                        show_pos, hide_pos, kpos);
+                        show_pos,
+                        hide_pos,
+                        kpos
+                    );
                 }
             }
         }
 
-        assert!(!kitty_positions.is_empty(), "should have rendered at least one kitty frame");
-        assert!(output.ends_with("\x1b[?25h") || output.contains("\x1b[?25h"),
-            "cursor must be visible somewhere in output");
+        assert!(
+            !kitty_positions.is_empty(),
+            "should have rendered at least one kitty frame"
+        );
+        assert!(
+            output.ends_with("\x1b[?25h") || output.contains("\x1b[?25h"),
+            "cursor must be visible somewhere in output"
+        );
     }
 }
 
@@ -2149,10 +2492,7 @@ fn open_file(path: &str) -> Result<(), String> {
     }
 }
 
-fn build_file_items<'a>(
-    matches: &[MatchEntry],
-    files: &[FileEntry],
-) -> Vec<ListItem<'a>> {
+fn build_file_items<'a>(matches: &[MatchEntry], files: &[FileEntry]) -> Vec<ListItem<'a>> {
     matches
         .iter()
         .filter_map(|matched| {
@@ -2202,10 +2542,11 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
     let area = frame.area();
     let wide_mode = area.width >= 100;
     let dual_columns = area.width >= 140;
+    let active_scope = app.active_scope();
 
     // Build file list items (all matches, scrolling handled by ListState)
     let (score_items, time_items, file_count) = {
-        let files = app.files.lock().unwrap();
+        let files = app.files_for_scope(active_scope).lock().unwrap();
         let count = files.len();
         let score_list = build_file_items(&app.matches, &files);
         let time_list = build_file_items(&app.matches_by_time, &files);
@@ -2232,10 +2573,13 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         PreviewContent::Video(_) => (vec![], true),
         PreviewContent::VideoStreaming(frames) => {
             if frames.is_empty() {
-                (vec![Line::from(Span::styled(
-                    "Loading video...",
-                    Style::default().fg(Color::Yellow),
-                ))], false)
+                (
+                    vec![Line::from(Span::styled(
+                        "Loading video...",
+                        Style::default().fg(Color::Yellow),
+                    ))],
+                    false,
+                )
             } else {
                 (vec![], true)
             }
@@ -2259,24 +2603,37 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         " Directory "
     } else {
         match &app.preview_content {
-            PreviewContent::Video(_) | PreviewContent::VideoStreaming(_) | PreviewContent::VideoLoading => " Video ",
+            PreviewContent::Video(_)
+            | PreviewContent::VideoStreaming(_)
+            | PreviewContent::VideoLoading => " Video ",
             PreviewContent::Image(_) => " Image ",
             _ => " Preview ",
         }
     };
     let preview = Paragraph::new(preview_lines).block(
         Block::default()
-            .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-            .title(Span::styled(preview_title, Style::default().fg(Color::Yellow))),
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+            .title(Span::styled(
+                preview_title,
+                Style::default().fg(Color::Yellow),
+            )),
     );
 
     // Status line
     let status = format!(
-        "{} matches{} | {} {}",
+        "{} matches{} | {} {} | pool: {}{}",
         app.matches.len(),
-        if app.is_loading() { " (loading...)" } else { "" },
+        if app.is_loading() {
+            " (loading...)"
+        } else {
+            ""
+        },
         file_count,
-        if app.dir_mode { "dirs" } else { "files" }
+        if app.dir_mode { "dirs" } else { "files" },
+        active_scope.label(),
+        if app.dir_mode { "" } else { " | z toggle" }
     );
     let status_widget = Paragraph::new(status)
         .style(Style::default().fg(Color::DarkGray))
@@ -2284,29 +2641,47 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
 
     // Help line
     let help = if app.drag_mode {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(" drag  "),
+        ];
+        if !app.dir_mode {
+            spans.push(Span::styled("z", Style::default().fg(Color::Yellow)));
+            spans.push(Span::raw(" pool  "));
+        }
+        spans.extend([
             Span::styled("Esc", Style::default().fg(Color::Cyan)),
             Span::raw(" cancel  "),
             Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
             Span::styled("^U", Style::default().fg(Color::Cyan)),
             Span::raw(" clr"),
-        ])
+        ]);
+        Line::from(spans)
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled("Enter", Style::default().fg(Color::Cyan)),
-            Span::raw(if app.dir_mode { " open dir  " } else { " open  " }),
+            Span::raw(if app.dir_mode {
+                " open dir  "
+            } else {
+                " open  "
+            }),
             Span::styled("^D", Style::default().fg(Color::Yellow)),
             Span::raw(" drag  "),
+        ];
+        if !app.dir_mode {
+            spans.push(Span::styled("z", Style::default().fg(Color::Yellow)));
+            spans.push(Span::raw(" pool  "));
+        }
+        spans.extend([
             Span::styled("Esc", Style::default().fg(Color::Cyan)),
             Span::raw(" cancel  "),
             Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Cyan)),
             Span::raw(" nav  "),
             Span::styled("^U", Style::default().fg(Color::Cyan)),
             Span::raw(" clr"),
-        ])
+        ]);
+        Line::from(spans)
     };
     let help_widget = Paragraph::new(help)
         .style(Style::default().fg(Color::DarkGray))
@@ -2317,8 +2692,13 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
-                .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-                .title(Span::styled(" \u{f002} ", Style::default().fg(Color::Cyan))),
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                .title(Span::styled(
+                    format!(" \u{f002} {} ", active_scope.label()),
+                    Style::default().fg(Color::Cyan),
+                )),
         );
 
     let (preview_area, cursor_pos) = if dual_columns {
@@ -2351,7 +2731,9 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
                 .highlight_symbol(" ")
                 .block(
                     Block::default()
-                        .borders(Borders::RIGHT).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                        .borders(Borders::RIGHT)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
                         .title(Span::styled(" Ranked ", Style::default().fg(Color::Cyan))),
                 ),
             file_cols[0],
@@ -2442,10 +2824,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         frame.render_widget(status_widget, chunks[3]);
         frame.render_widget(help_widget, chunks[4]);
 
-        let cursor_pos = (
-            chunks[0].x + app.query.len() as u16 + 1,
-            chunks[0].y + 1,
-        );
+        let cursor_pos = (chunks[0].x + app.query.len() as u16 + 1, chunks[0].y + 1);
         frame.set_cursor_position(cursor_pos);
 
         (chunks[2], cursor_pos)
@@ -2460,101 +2839,129 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
 
 fn run_test_video() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let path = args.get(2).map(|s| s.as_str()).unwrap_or("/home/jeremy/recording.mp4");
-    
+    let path = args
+        .get(2)
+        .map(|s| s.as_str())
+        .unwrap_or("/home/jeremy/recording.mp4");
+
     eprintln!("=== Video Pipeline Test: {} ===\n", path);
-    
+
     // Step 1: ffprobe duration
     let start = Instant::now();
     let dur = get_video_duration(path);
     eprintln!("[{:?}] duration: {:?}", start.elapsed(), dur);
-    
+
     // Step 2: ffprobe dimensions
     let start2 = Instant::now();
     let dims = get_video_dimensions(path);
     eprintln!("[{:?}] dimensions: {:?}", start2.elapsed(), dims);
-    
+
     let (src_w, src_h) = dims.unwrap_or((640, 480));
-    let (out_w, out_h) = compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+    let (out_w, out_h) =
+        compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
     let frame_size = (out_w * out_h * 3) as usize;
-    eprintln!("  scaled: {}x{}, raw frame: {} bytes\n", out_w, out_h, frame_size);
-    
+    eprintln!(
+        "  scaled: {}x{}, raw frame: {} bytes\n",
+        out_w, out_h, frame_size
+    );
+
     // Step 3: Stream frames (same as runtime)
     let shared = Arc::new(Mutex::new(Vec::new()));
     let shared_clone = Arc::clone(&shared);
     let done = Arc::new(Mutex::new(false));
     let done_clone = Arc::clone(&done);
     let path_owned = path.to_string();
-    
+
     let stream_start = Instant::now();
     thread::spawn(move || {
         stream_video_frames(&path_owned, shared_clone);
         *done_clone.lock().unwrap() = true;
     });
-    
+
     // Simulate the UI polling loop
     let mut last_count = 0;
     let mut first_frame_at = None;
     let mut state_transitions = Vec::new();
-    
+
     loop {
         let frames = shared.lock().unwrap();
         let count = frames.len();
         let is_done = *done.lock().unwrap();
-        
+
         if count != last_count {
             if first_frame_at.is_none() {
                 first_frame_at = Some(stream_start.elapsed());
-                state_transitions.push(format!("[{:?}] VideoLoading -> VideoStreaming (1 frame, {} bytes)", 
-                    stream_start.elapsed(), frames[0].data.len()));
+                state_transitions.push(format!(
+                    "[{:?}] VideoLoading -> VideoStreaming (1 frame, {} bytes)",
+                    stream_start.elapsed(),
+                    frames[0].data.len()
+                ));
             }
             if count % 10 == 0 || is_done {
-                eprintln!("[{:?}] {} frames (latest: {} bytes)", 
-                    stream_start.elapsed(), count, frames.last().map(|f| f.data.len()).unwrap_or(0));
+                eprintln!(
+                    "[{:?}] {} frames (latest: {} bytes)",
+                    stream_start.elapsed(),
+                    count,
+                    frames.last().map(|f| f.data.len()).unwrap_or(0)
+                );
             }
             last_count = count;
         }
         drop(frames);
-        
+
         if is_done {
-            state_transitions.push(format!("[{:?}] VideoStreaming -> Video ({} frames)", 
-                stream_start.elapsed(), last_count));
+            state_transitions.push(format!(
+                "[{:?}] VideoStreaming -> Video ({} frames)",
+                stream_start.elapsed(),
+                last_count
+            ));
             break;
         }
-        
+
         thread::sleep(Duration::from_millis(16));
     }
-    
+
     eprintln!("\n=== Results ===");
     for t in &state_transitions {
         eprintln!("  {}", t);
     }
-    
+
     let frames = shared.lock().unwrap();
     let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
     eprintln!("\n  frames: {}", frames.len());
-    eprintln!("  first frame latency: {:?}", first_frame_at.unwrap_or_default());
+    eprintln!(
+        "  first frame latency: {:?}",
+        first_frame_at.unwrap_or_default()
+    );
     eprintln!("  total time: {:?}", stream_start.elapsed());
-    eprintln!("  memory: {:.1} MiB ({:.1} KiB avg/frame)", 
+    eprintln!(
+        "  memory: {:.1} MiB ({:.1} KiB avg/frame)",
         total_bytes as f64 / (1024.0 * 1024.0),
-        total_bytes as f64 / (frames.len().max(1) as f64 * 1024.0));
-    
+        total_bytes as f64 / (frames.len().max(1) as f64 * 1024.0)
+    );
+
     // Flicker test: check if any frames have zero or suspiciously small sizes
     let mut bad_frames = 0;
     for (i, f) in frames.iter().enumerate() {
         if f.data.len() < 100 || f.width == 0 || f.height == 0 {
-            eprintln!("  WARNING: frame {} looks bad: {} bytes, {}x{}", i, f.data.len(), f.width, f.height);
+            eprintln!(
+                "  WARNING: frame {} looks bad: {} bytes, {}x{}",
+                i,
+                f.data.len(),
+                f.width,
+                f.height
+            );
             bad_frames += 1;
         }
     }
     if bad_frames == 0 {
         eprintln!("  all frames valid ✓");
     }
-    
+
     // Check for duplicate/identical frames (could cause visual stutter)
     let mut dupes = 0;
     for i in 1..frames.len() {
-        if frames[i].data == frames[i-1].data {
+        if frames[i].data == frames[i - 1].data {
             dupes += 1;
         }
     }
@@ -2563,18 +2970,18 @@ fn run_test_video() -> io::Result<()> {
     } else {
         eprintln!("  no duplicate frames ✓");
     }
-    
+
     // Flicker test: simulate the render loop and check if frame index stays valid
     eprintln!("\n=== Flicker Simulation ===");
     let frame_count = frames.len();
     drop(frames);
-    
+
     let mut video_frame = 0usize;
     let mut video_frame_time = Instant::now();
     let mut render_count = 0;
     let mut out_of_bounds = 0;
     let sim_start = Instant::now();
-    
+
     // Simulate 5 seconds of playback
     while sim_start.elapsed() < Duration::from_secs(5) {
         if video_frame_time.elapsed() >= Duration::from_millis(VIDEO_FRAME_INTERVAL_MS) {
@@ -2588,12 +2995,15 @@ fn run_test_video() -> io::Result<()> {
         render_count += 1;
         thread::sleep(Duration::from_millis(16));
     }
-    
-    eprintln!("  {} render cycles, {} out-of-bounds corrections", render_count, out_of_bounds);
+
+    eprintln!(
+        "  {} render cycles, {} out-of-bounds corrections",
+        render_count, out_of_bounds
+    );
     if out_of_bounds == 0 {
         eprintln!("  frame indexing OK ✓");
     }
-    
+
     Ok(())
 }
 
@@ -2604,7 +3014,10 @@ struct WriteRecorder<W: Write> {
 
 impl<W: Write> WriteRecorder<W> {
     fn new(inner: W) -> Self {
-        Self { inner, writes: Vec::new() }
+        Self {
+            inner,
+            writes: Vec::new(),
+        }
     }
 }
 
@@ -2620,18 +3033,30 @@ impl<W: Write> Write for WriteRecorder<W> {
 }
 
 fn run_bench_flicker() -> io::Result<()> {
-    let area = Rect { x: 60, y: 2, width: 50, height: 25 };
+    let area = Rect {
+        x: 60,
+        y: 2,
+        width: 50,
+        height: 25,
+    };
     let cursor_input = (15u16, 1u16);
 
     let frame_w = 160u32;
     let frame_h = 90u32;
-    let frames: Vec<CachedImage> = (0..30).map(|i| {
-        let mut data = vec![0u8; (frame_w * frame_h * 3) as usize];
-        for (j, b) in data.iter_mut().enumerate() {
-            *b = ((i * 7 + j) & 0xFF) as u8;
-        }
-        CachedImage { data, width: frame_w, height: frame_h, is_raw_rgb: true }
-    }).collect();
+    let frames: Vec<CachedImage> = (0..30)
+        .map(|i| {
+            let mut data = vec![0u8; (frame_w * frame_h * 3) as usize];
+            for (j, b) in data.iter_mut().enumerate() {
+                *b = ((i * 7 + j) & 0xFF) as u8;
+            }
+            CachedImage {
+                data,
+                width: frame_w,
+                height: frame_h,
+                is_raw_rgb: true,
+            }
+        })
+        .collect();
 
     eprintln!("=== Flicker Benchmark ===");
     eprintln!("  {} frames, {}x{} raw RGB", frames.len(), frame_w, frame_h);
@@ -2649,7 +3074,12 @@ fn run_bench_flicker() -> io::Result<()> {
 
         for cycle in 0..120 {
             // Simulate ratatui draw output (cursor show at input)
-            write!(recorder, "\x1b[{};{}H\x1b[?25h", cursor_input.1 + 1, cursor_input.0 + 1)?;
+            write!(
+                recorder,
+                "\x1b[{};{}H\x1b[?25h",
+                cursor_input.1 + 1,
+                cursor_input.0 + 1
+            )?;
 
             let elapsed = if cycle == 0 {
                 Duration::from_millis(0)
@@ -2669,7 +3099,12 @@ fn run_bench_flicker() -> io::Result<()> {
                     let mut buf: Vec<u8> = Vec::with_capacity(frame.data.len() * 2);
                     write!(buf, "\x1b[?25l")?;
                     render_kitty_image_to(frame, area, &mut buf)?;
-                    write!(buf, "\x1b[{};{}H\x1b[?25h", cursor_input.1 + 1, cursor_input.0 + 1)?;
+                    write!(
+                        buf,
+                        "\x1b[{};{}H\x1b[?25h",
+                        cursor_input.1 + 1,
+                        cursor_input.0 + 1
+                    )?;
                     recorder.write_all(&buf)?;
                     recorder.flush()?;
                 }
@@ -2692,7 +3127,12 @@ fn run_bench_flicker() -> io::Result<()> {
         let preview_path = "/bench/video.mp4";
 
         for cycle in 0..120 {
-            write!(recorder, "\x1b[{};{}H\x1b[?25h", cursor_input.1 + 1, cursor_input.0 + 1)?;
+            write!(
+                recorder,
+                "\x1b[{};{}H\x1b[?25h",
+                cursor_input.1 + 1,
+                cursor_input.0 + 1
+            )?;
 
             let elapsed = if cycle == 0 {
                 Duration::from_millis(0)
@@ -2732,10 +3172,14 @@ fn run_bench_flicker() -> io::Result<()> {
 fn analyze_writes(label: &str, writes: &[(Instant, usize, Vec<u8>)], elapsed: Duration) {
     eprintln!("--- {} ({:?}) ---", label, elapsed);
     eprintln!("  total writes: {}", writes.len());
-    
+
     let total_bytes: usize = writes.iter().map(|(_, n, _)| n).sum();
-    eprintln!("  total bytes: {} ({:.1} MiB)", total_bytes, total_bytes as f64 / (1024.0 * 1024.0));
-    
+    eprintln!(
+        "  total bytes: {} ({:.1} MiB)",
+        total_bytes,
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+
     let sizes: Vec<usize> = writes.iter().map(|(_, n, _)| *n).collect();
     if !sizes.is_empty() {
         let min = sizes.iter().min().unwrap();
@@ -2758,7 +3202,7 @@ fn analyze_writes(label: &str, writes: &[(Instant, usize, Vec<u8>)], elapsed: Du
         let s = String::from_utf8_lossy(data);
         let mut pos = 0;
         let bytes = s.as_bytes();
-        
+
         while pos < bytes.len() {
             if s[pos..].starts_with("\x1b[?25h") {
                 if !cursor_at_input {
@@ -2797,8 +3241,14 @@ fn analyze_writes(label: &str, writes: &[(Instant, usize, Vec<u8>)], elapsed: Du
     }
 
     eprintln!("  kitty renders: {}", kitty_renders);
-    eprintln!("  FLICKER - kitty while cursor visible: {}", kitty_while_visible);
-    eprintln!("  FLICKER - cursor shown without reposition: {}", show_without_reposition);
+    eprintln!(
+        "  FLICKER - kitty while cursor visible: {}",
+        kitty_while_visible
+    );
+    eprintln!(
+        "  FLICKER - cursor shown without reposition: {}",
+        show_without_reposition
+    );
     eprintln!("  total flicker events: {}", flicker_count);
 
     // Count write boundaries that split hide/show
@@ -2856,6 +3306,10 @@ fn main() -> io::Result<()> {
     }
     let drag_mode = args.iter().any(|arg| arg == "--drag");
     let dir_mode = args.iter().any(|arg| arg == "--dir");
+    let selection_path = args
+        .iter()
+        .position(|arg| arg == "--selection-path")
+        .and_then(|i| args.get(i + 1).cloned());
 
     // Setup terminal
     enable_raw_mode()?;
@@ -2938,7 +3392,9 @@ fn main() -> io::Result<()> {
                     (KeyCode::Esc, _) => break,
                     (KeyCode::Enter, _) => {
                         if let Some(file) = app.selected_file() {
-                            if app.drag_mode {
+                            if selection_path.is_some() {
+                                chosen = Some(ExitAction::Choose(file));
+                            } else if app.drag_mode {
                                 chosen = Some(ExitAction::Drag(file));
                             } else {
                                 chosen = Some(ExitAction::Open(file));
@@ -3000,6 +3456,9 @@ fn main() -> io::Result<()> {
                                 .spawn();
                         }
                     }
+                    (KeyCode::Char('z'), KeyModifiers::NONE) => {
+                        app.toggle_search_scope();
+                    }
                     (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                         app.query.clear();
                         app.selected = 0;
@@ -3039,6 +3498,15 @@ fn main() -> io::Result<()> {
     // Open or drag the file after terminal is restored
     if let Some(action) = chosen {
         let (path, result) = match action {
+            ExitAction::Choose(path) => {
+                let r = if let Some(selection_file) = selection_path.as_ref() {
+                    fs::write(selection_file, format!("{}\n", path))
+                        .map_err(|e| format!("Failed to write selection path: {}", e))
+                } else {
+                    Ok(())
+                };
+                (path, r)
+            }
             ExitAction::Drag(path) => {
                 let r = drag_file(&path);
                 (path, r)
