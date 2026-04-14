@@ -144,12 +144,14 @@ struct App {
     query: String,
     recent_files: Arc<Mutex<Vec<FileEntry>>>,
     all_files: Arc<Mutex<Vec<FileEntry>>>,
+    dir_entries: Arc<Mutex<Vec<FileEntry>>>,
     matches: Vec<MatchEntry>,
     matches_by_time: Vec<MatchEntry>,
     selected: usize,
     active_column: usize, // 0 = ranked, 1 = recent
     recent_loading: Arc<Mutex<bool>>,
     all_loading: Arc<Mutex<bool>>,
+    dir_loading: Arc<Mutex<bool>>,
     search_scope: SearchScope,
     last_query: String,
     last_file_count: usize,
@@ -174,8 +176,10 @@ impl App {
     fn new(dir_mode: bool) -> Self {
         let recent_files = Arc::new(Mutex::new(Vec::new()));
         let all_files = Arc::new(Mutex::new(Vec::new()));
+        let dir_entries = Arc::new(Mutex::new(Vec::new()));
         let recent_loading = Arc::new(Mutex::new(false));
         let all_loading = Arc::new(Mutex::new(false));
+        let dir_loading = Arc::new(Mutex::new(false));
         let search_scope = if dir_mode {
             SearchScope::All
         } else {
@@ -184,8 +188,8 @@ impl App {
 
         if dir_mode {
             spawn_entry_loader(
-                Arc::clone(&all_files),
-                Arc::clone(&all_loading),
+                Arc::clone(&dir_entries),
+                Arc::clone(&dir_loading),
                 dir_mode,
                 false,
             );
@@ -206,12 +210,14 @@ impl App {
             query: String::new(),
             recent_files,
             all_files,
+            dir_entries,
             matches: Vec::new(),
             matches_by_time: Vec::new(),
             selected: 0,
             active_column: 0,
             recent_loading,
             all_loading,
+            dir_loading,
             search_scope,
             last_query: String::new(),
             last_file_count: 0,
@@ -234,6 +240,10 @@ impl App {
     }
 
     fn files_for_scope(&self, scope: SearchScope) -> &Arc<Mutex<Vec<FileEntry>>> {
+        if self.dir_mode {
+            return &self.dir_entries;
+        }
+
         match scope {
             SearchScope::Recent => &self.recent_files,
             SearchScope::All => &self.all_files,
@@ -241,6 +251,10 @@ impl App {
     }
 
     fn loading_for_scope(&self, scope: SearchScope) -> &Arc<Mutex<bool>> {
+        if self.dir_mode {
+            return &self.dir_loading;
+        }
+
         match scope {
             SearchScope::Recent => &self.recent_loading,
             SearchScope::All => &self.all_loading,
@@ -273,6 +287,43 @@ impl App {
                     Arc::clone(&self.all_loading),
                     self.dir_mode,
                     false,
+                );
+            }
+        }
+    }
+
+    fn toggle_entry_mode(&mut self) {
+        self.dir_mode = !self.dir_mode;
+        self.selected = 0;
+        self.preview_path.clear();
+        self.preview_content = PreviewContent::None;
+        self.last_query.clear();
+        self.last_file_count = 0;
+
+        if self.dir_mode {
+            let needs_load = self.dir_entries.lock().unwrap().is_empty();
+            let is_loading = *self.dir_loading.lock().unwrap();
+            if needs_load && !is_loading {
+                spawn_entry_loader(
+                    Arc::clone(&self.dir_entries),
+                    Arc::clone(&self.dir_loading),
+                    true,
+                    false,
+                );
+            }
+        } else {
+            let scope = self.search_scope;
+            let files = self.files_for_scope(scope);
+            let loading = self.loading_for_scope(scope);
+            let needs_load = files.lock().unwrap().is_empty();
+            let is_loading = *loading.lock().unwrap();
+
+            if needs_load && !is_loading {
+                spawn_entry_loader(
+                    Arc::clone(files),
+                    Arc::clone(loading),
+                    false,
+                    scope == SearchScope::Recent,
                 );
             }
         }
@@ -2623,7 +2674,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
 
     // Status line
     let status = format!(
-        "{} matches{} | {} {} | pool: {}{}",
+        "{} matches{} | {} {} | pool: {}{}{}",
         app.matches.len(),
         if app.is_loading() {
             " (loading...)"
@@ -2633,7 +2684,8 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         file_count,
         if app.dir_mode { "dirs" } else { "files" },
         active_scope.label(),
-        if app.dir_mode { "" } else { " | ^Z toggle" }
+        if app.dir_mode { "" } else { " | ^Z pool" },
+        " | ^P mode"
     );
     let status_widget = Paragraph::new(status)
         .style(Style::default().fg(Color::DarkGray))
@@ -2644,6 +2696,8 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         let mut spans = vec![
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(" drag  "),
+            Span::styled("^P", Style::default().fg(Color::Yellow)),
+            Span::raw(if app.dir_mode { " files  " } else { " dirs  " }),
         ];
         if !app.dir_mode {
             spans.push(Span::styled("z", Style::default().fg(Color::Yellow)));
@@ -2666,6 +2720,8 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
             } else {
                 " open  "
             }),
+            Span::styled("^P", Style::default().fg(Color::Yellow)),
+            Span::raw(if app.dir_mode { " files  " } else { " dirs  " }),
             Span::styled("^D", Style::default().fg(Color::Yellow)),
             Span::raw(" drag  "),
         ];
@@ -3424,8 +3480,10 @@ fn main() -> io::Result<()> {
                             app.selected += 1;
                         }
                     }
-                    (KeyCode::Char('p'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                        app.toggle_entry_mode();
+                    }
+                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                         if app.selected > 0 {
                             app.selected -= 1;
                         }

@@ -55,6 +55,8 @@ ffp --dir        # Launch directory picker
 ffp --profile    # Run performance profiler
 ```
 
+By default, `ffp` searches files only. Use `--dir` to start in directory mode, or press `Ctrl+P` in the app to toggle between files and directories.
+
 ## Keybindings
 
 | Key | Action |
@@ -63,7 +65,8 @@ ffp --profile    # Run performance profiler
 | `Esc` | Cancel |
 | `↑/↓` | Navigate |
 | `Ctrl+N/J` | Next item |
-| `Ctrl+P/K` | Previous item |
+| `Ctrl+K` | Previous item |
+| `Ctrl+P` | Toggle between files and directories |
 | `Ctrl+Z` | Toggle between recent-only and all-files search |
 | `Ctrl+U` | Clear query |
 | `Ctrl+W` | Delete word |
