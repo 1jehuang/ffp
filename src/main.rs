@@ -102,6 +102,7 @@ type PendingVideoCache = Arc<Mutex<Option<(String, Vec<CachedImage>)>>>;
 
 struct FileEntry {
     path: String,
+    path_lower: String,
     name: String,
     name_lower: String,
     dir: String,
@@ -1306,6 +1307,7 @@ impl FileEntry {
         let name = basename(&path).to_string();
         let dir = dirname(&path).to_string();
         let name_lower = name.to_lowercase();
+        let path_lower = path.to_lowercase();
         let is_dir = metadata.map(|m| m.is_dir()).unwrap_or(false);
         let mtime = metadata
             .and_then(|m| m.modified().ok())
@@ -1320,6 +1322,7 @@ impl FileEntry {
 
         Self {
             path,
+            path_lower,
             name,
             name_lower,
             dir,
@@ -1939,6 +1942,13 @@ fn get_icon(filename: &str) -> (&'static str, Color) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TypoWordMatch {
+    cost: usize,
+    start: usize,
+    span_len: usize,
+}
+
 fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry> {
     if limit == 0 {
         return Vec::new();
@@ -1957,12 +1967,11 @@ fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry
     }
 
     let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
     let mut results = Vec::new();
 
     for (index, entry) in files.iter().enumerate() {
-        // ratio returns 0.0-1.0, multiply by 100 for percentage
-        let score = ratio(query_lower.chars(), entry.name_lower.chars()) * 100.0;
-        if score > 35.0 {
+        if let Some(score) = file_match_score(&query_lower, &query_words, entry) {
             results.push(MatchEntry { index, score });
         }
     }
@@ -1976,6 +1985,355 @@ fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     results
+}
+
+fn file_match_score(query_lower: &str, query_words: &[&str], entry: &FileEntry) -> Option<f64> {
+    let ratio_score = ratio(query_lower.chars(), entry.name_lower.chars()) * 100.0;
+
+    let name_score = if should_run_name_typo_match(ratio_score, query_words, &entry.name_lower) {
+        typo_match_text_score(query_words, &entry.name_lower, 10_000.0)
+    } else {
+        None
+    };
+    let path_score = if query_words.len() <= 1 || entry.path_lower == entry.name_lower {
+        None
+    } else {
+        typo_match_text_score(query_words, &entry.path_lower, 6_000.0)
+    };
+
+    name_score
+        .into_iter()
+        .chain(path_score)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+        .map(|score| score + ratio_score / 10.0)
+        .or_else(|| (ratio_score > 35.0).then_some(ratio_score))
+}
+
+fn should_run_name_typo_match(ratio_score: f64, query_words: &[&str], name: &str) -> bool {
+    if ratio_score >= 45.0 {
+        return true;
+    }
+
+    query_words
+        .iter()
+        .any(|word| word.len() > 2 && name.contains(word))
+}
+
+fn typo_match_text_score(words: &[&str], text: &str, base_score: f64) -> Option<f64> {
+    let mut score = base_score;
+
+    for word in words {
+        let matched = typo_match_word(word, text)?;
+        let exact_bonus = if matched.cost == 0 { 50.0 } else { 0.0 };
+        let prefix_bonus = if matched.start == 0 { 100.0 } else { 0.0 };
+        score += 300.0 + exact_bonus + prefix_bonus;
+        score += matched.span_len as f64 * 20.0;
+        score -= matched.start as f64 * 2.0;
+        score -= matched.cost as f64 * 100.0;
+    }
+
+    Some(score)
+}
+
+fn typo_match_word(word: &str, text: &str) -> Option<TypoWordMatch> {
+    if word.is_empty() {
+        return Some(TypoWordMatch {
+            cost: 0,
+            start: 0,
+            span_len: 0,
+        });
+    }
+
+    if let Some(start) = text.find(word) {
+        return Some(TypoWordMatch {
+            cost: 0,
+            start,
+            span_len: word.chars().count(),
+        });
+    }
+
+    // Very short typo matching creates too many noisy matches and wastes CPU.
+    // Keep 1-2 character queries as exact substring / rapidfuzz fallback only.
+    if word.chars().count() <= 2 {
+        return None;
+    }
+
+    let word_char_count = word.chars().count();
+    let max_dist = if word_char_count <= 4 { 1 } else { 2 };
+
+    if !has_typo_candidate_overlap(word, text, max_dist) {
+        return None;
+    }
+
+    if word.len() > 64 {
+        return None;
+    }
+
+    let matched = if word.is_ascii() && text.is_ascii() {
+        typo_match_word_osa_substring_ascii(word.as_bytes(), text.as_bytes(), max_dist)
+    } else {
+        let word_chars: Vec<char> = word.chars().collect();
+        let text_chars: Vec<char> = text.chars().collect();
+        typo_match_word_osa_substring(&word_chars, &text_chars, max_dist)
+    }?;
+
+    if matched.cost > max_dist || matched.cost >= word_char_count {
+        None
+    } else {
+        Some(matched)
+    }
+}
+
+fn has_typo_candidate_overlap(word: &str, text: &str, max_dist: usize) -> bool {
+    let min_overlap = word.chars().count().saturating_sub(max_dist);
+    if min_overlap == 0 {
+        return true;
+    }
+
+    if word.is_ascii() && text.is_ascii() {
+        let mut counts = [0u8; 256];
+        for byte in text.bytes() {
+            let idx = byte.to_ascii_lowercase() as usize;
+            counts[idx] = counts[idx].saturating_add(1);
+        }
+
+        let mut overlap = 0usize;
+        for byte in word.bytes() {
+            let idx = byte.to_ascii_lowercase() as usize;
+            if counts[idx] > 0 {
+                counts[idx] -= 1;
+                overlap += 1;
+                if overlap >= min_overlap {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    let mut text_chars: Vec<char> = text.chars().collect();
+    let mut overlap = 0usize;
+    for ch in word.chars() {
+        if let Some(pos) = text_chars.iter().position(|candidate| *candidate == ch) {
+            text_chars.swap_remove(pos);
+            overlap += 1;
+            if overlap >= min_overlap {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn typo_match_word_osa_substring<T: Eq + Copy>(
+    pattern: &[T],
+    text: &[T],
+    max_dist: usize,
+) -> Option<TypoWordMatch> {
+    if pattern.is_empty() {
+        return Some(TypoWordMatch {
+            cost: 0,
+            start: 0,
+            span_len: 0,
+        });
+    }
+
+    if pattern.len() > text.len().saturating_add(max_dist) {
+        return None;
+    }
+
+    let sat = max_dist + 1;
+    let plen = pattern.len();
+    let mut prev: Vec<usize> = (0..=plen).map(|i| i.min(sat)).collect();
+    let mut curr = vec![0; plen + 1];
+    let mut prev2 = prev.clone();
+
+    let mut prev_start = vec![0; plen + 1];
+    let mut curr_start = vec![0; plen + 1];
+    let mut prev2_start = vec![0; plen + 1];
+
+    let mut best_cost = sat;
+    let mut best_start = 0;
+    let mut best_span_len = 0;
+    let mut prev_text: Option<T> = None;
+
+    for (j0, &text_ch) in text.iter().enumerate() {
+        let j = j0 + 1;
+        curr[0] = 0;
+        curr_start[0] = j;
+
+        for i in 1..=plen {
+            let deletion = (curr[i - 1] + 1).min(sat);
+            let insertion = (prev[i] + 1).min(sat);
+            let substitution = (prev[i - 1] + usize::from(pattern[i - 1] != text_ch)).min(sat);
+
+            let mut best = deletion;
+            let mut start = curr_start[i - 1];
+
+            if insertion < best || (insertion == best && prev_start[i] < start) {
+                best = insertion;
+                start = prev_start[i];
+            }
+
+            if substitution < best || (substitution == best && prev_start[i - 1] < start) {
+                best = substitution;
+                start = prev_start[i - 1];
+            }
+
+            if let Some(prev_ch) = prev_text {
+                if j > 1 && i > 1 && pattern[i - 1] == prev_ch && pattern[i - 2] == text_ch {
+                    let transposition = (prev2[i - 2] + 1).min(sat);
+                    if transposition < best || (transposition == best && prev2_start[i - 2] < start)
+                    {
+                        best = transposition;
+                        start = prev2_start[i - 2];
+                    }
+                }
+            }
+
+            curr[i] = best;
+            curr_start[i] = start;
+        }
+
+        let span_len = j.saturating_sub(curr_start[plen]);
+        if curr[plen] < best_cost
+            || (curr[plen] == best_cost
+                && (curr_start[plen] < best_start
+                    || (curr_start[plen] == best_start && span_len > best_span_len)))
+        {
+            best_cost = curr[plen];
+            best_start = curr_start[plen];
+            best_span_len = span_len;
+        }
+
+        if best_cost == 0 {
+            break;
+        }
+
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(&mut prev2_start, &mut prev_start);
+        std::mem::swap(&mut prev_start, &mut curr_start);
+        prev_text = Some(text_ch);
+    }
+
+    (best_cost <= max_dist).then_some(TypoWordMatch {
+        cost: best_cost,
+        start: best_start,
+        span_len: best_span_len,
+    })
+}
+
+fn typo_match_word_osa_substring_ascii(
+    pattern: &[u8],
+    text: &[u8],
+    max_dist: usize,
+) -> Option<TypoWordMatch> {
+    const MAX_WORD_LEN: usize = 64;
+
+    let plen = pattern.len();
+    if plen == 0 {
+        return Some(TypoWordMatch {
+            cost: 0,
+            start: 0,
+            span_len: 0,
+        });
+    }
+
+    if plen > MAX_WORD_LEN || plen > text.len().saturating_add(max_dist) {
+        return None;
+    }
+
+    let sat = max_dist + 1;
+    let mut prev = [0usize; MAX_WORD_LEN + 1];
+    let mut curr = [0usize; MAX_WORD_LEN + 1];
+    let mut prev2 = [0usize; MAX_WORD_LEN + 1];
+    let mut prev_start = [0usize; MAX_WORD_LEN + 1];
+    let mut curr_start = [0usize; MAX_WORD_LEN + 1];
+    let mut prev2_start = [0usize; MAX_WORD_LEN + 1];
+
+    for i in 0..=plen {
+        prev[i] = i.min(sat);
+        prev2[i] = prev[i];
+    }
+
+    let mut best_cost = sat;
+    let mut best_start = 0;
+    let mut best_span_len = 0;
+    let mut prev_text: Option<u8> = None;
+
+    for (j0, &raw_ch) in text.iter().enumerate() {
+        let j = j0 + 1;
+        let text_ch = raw_ch.to_ascii_lowercase();
+        curr[0] = 0;
+        curr_start[0] = j;
+
+        for i in 1..=plen {
+            let pattern_ch = pattern[i - 1].to_ascii_lowercase();
+            let deletion = (curr[i - 1] + 1).min(sat);
+            let insertion = (prev[i] + 1).min(sat);
+            let substitution = (prev[i - 1] + usize::from(pattern_ch != text_ch)).min(sat);
+
+            let mut best = deletion;
+            let mut start = curr_start[i - 1];
+
+            if insertion < best || (insertion == best && prev_start[i] < start) {
+                best = insertion;
+                start = prev_start[i];
+            }
+
+            if substitution < best || (substitution == best && prev_start[i - 1] < start) {
+                best = substitution;
+                start = prev_start[i - 1];
+            }
+
+            if let Some(prev_ch) = prev_text {
+                if j > 1
+                    && i > 1
+                    && pattern_ch == prev_ch
+                    && pattern[i - 2].to_ascii_lowercase() == text_ch
+                {
+                    let transposition = (prev2[i - 2] + 1).min(sat);
+                    if transposition < best || (transposition == best && prev2_start[i - 2] < start)
+                    {
+                        best = transposition;
+                        start = prev2_start[i - 2];
+                    }
+                }
+            }
+
+            curr[i] = best;
+            curr_start[i] = start;
+        }
+
+        let span_len = j.saturating_sub(curr_start[plen]);
+        if curr[plen] < best_cost
+            || (curr[plen] == best_cost
+                && (curr_start[plen] < best_start
+                    || (curr_start[plen] == best_start && span_len > best_span_len)))
+        {
+            best_cost = curr[plen];
+            best_start = curr_start[plen];
+            best_span_len = span_len;
+        }
+
+        if best_cost == 0 {
+            break;
+        }
+
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(&mut prev2_start, &mut prev_start);
+        std::mem::swap(&mut prev_start, &mut curr_start);
+        prev_text = Some(text_ch);
+    }
+
+    (best_cost <= max_dist).then_some(TypoWordMatch {
+        cost: best_cost,
+        start: best_start,
+        span_len: best_span_len,
+    })
 }
 
 fn is_text_mime(mime_type: &str) -> bool {
@@ -2412,6 +2770,78 @@ mod tests {
         let files = vec![FileEntry::new("Résumé.txt".to_string())];
 
         let matches = fuzzy_match("résumé", &files, 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].index, 0);
+    }
+
+    #[test]
+    fn typo_match_handles_common_edits() {
+        assert_eq!(
+            typo_match_word("mian", "main.rs"),
+            Some(TypoWordMatch {
+                cost: 1,
+                start: 0,
+                span_len: 4,
+            })
+        );
+        assert_eq!(
+            typo_match_word("documnt", "document.pdf"),
+            Some(TypoWordMatch {
+                cost: 1,
+                start: 0,
+                span_len: 8,
+            })
+        );
+        assert_eq!(
+            typo_match_word("configg", "config.toml"),
+            Some(TypoWordMatch {
+                cost: 1,
+                start: 0,
+                span_len: 7,
+            })
+        );
+        assert!(typo_match_word("zzzz", "main.rs").is_none());
+    }
+
+    #[test]
+    fn fuzzy_match_is_typo_resistant() {
+        let files = vec![
+            FileEntry::new("many.rs".to_string()),
+            FileEntry::new("main.rs".to_string()),
+            FileEntry::new("document.pdf".to_string()),
+            FileEntry::new("config.toml".to_string()),
+        ];
+
+        let matches = fuzzy_match("mian", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "main.rs");
+
+        let matches = fuzzy_match("documnt", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "document.pdf");
+
+        let matches = fuzzy_match("configg", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "config.toml");
+    }
+
+    #[test]
+    fn fuzzy_match_uses_path_for_multi_word_queries() {
+        let files = vec![
+            FileEntry::new("/tmp/other/session-log.txt".to_string()),
+            FileEntry::new("/tmp/jcode/session-log.txt".to_string()),
+        ];
+
+        let matches = fuzzy_match("jcode sessino", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].path, "/tmp/jcode/session-log.txt");
+    }
+
+    #[test]
+    fn fuzzy_match_still_handles_short_substrings() {
+        let files = vec![FileEntry::new("main.rs".to_string())];
+
+        let matches = fuzzy_match("rs", &files, 10);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].index, 0);
     }
