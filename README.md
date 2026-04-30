@@ -1,7 +1,7 @@
 # ffp - Fast File Picker
 
 A fuzzy file picker for the terminal with image and video preview support using the Kitty graphics protocol.
-ffp searches only your recent files with no cache, so you can select recently updated/created files without searching through your entire computer
+ffp starts with your recent files, so you can select recently updated or opened files without searching through your entire computer.
 
 <img width="2877" height="1762" alt="image" src="https://github.com/user-attachments/assets/d3937bbd-80fb-4eec-8ee5-4b3c984f08ad" />
 <img width="2877" height="1762" alt="image" src="https://github.com/user-attachments/assets/8fabe1f0-131d-495f-8153-eccf2038eeb8" />
@@ -11,40 +11,53 @@ ffp searches only your recent files with no cache, so you can select recently up
 - Fuzzy file search with rapidfuzz
 - Image preview (PNG, JPEG, GIF, WebP) via Kitty graphics protocol
 - Text file preview
-- Files sorted by modification time (most recent first)
-- File discovery defaults to files changed within the last 9 days
-- Press `z` to toggle between recent files and all files
+- Files sorted by combined recency: ffp open history, desktop recent files, access time, then modification time
+- Recent discovery defaults to files interacted with within the last 9 days
+- Preview reads avoid updating access time where Linux permits `O_NOATIME`
+- Press `Ctrl+Z` to toggle between recent files and all files
 - LRU thumbnail cache for fast image switching
+
+## Recency model
+
+Recent mode merges multiple sources and keeps the UI responsive:
+
+1. `ffp` history for files selected through `ffp`, stored at `~/.local/state/ffp/recent.tsv`.
+2. Desktop recent files from `~/.local/share/recently-used.xbel`.
+3. Filesystem access time (`atime`) and modification time (`mtime`).
+
+The recent pool is capped to the 20,000 most recent entries after filtering generated/dependency-heavy directories such as `target`, `.rustup`, Cargo registries, Go module cache, virtualenvs, and `__pycache__`.
+
+Linux usually uses `relatime`, so filesystem `atime` may update at most daily for repeated reads. The `ffp` history makes files opened through `ffp` precise even when `atime` is not updated.
 
 ## Performance
 
-Profiled on ~5300 files:
+Profiled on 20,000 recent files:
 
 | Operation | Time |
 |-----------|------|
-| File loading | ~90ms |
-| Empty query match | ~1µs |
-| Fuzzy search | ~500-600µs |
+| File loading | ~2.7s background load |
+| Empty query match | ~2µs |
+| Fuzzy search | ~2-3ms |
 | Image thumbnail (cold) | 10-20ms |
-| Image thumbnail (cached) | <1µs |
+| Image thumbnail (cached) | ~10-15µs |
 
 ### Detailed Profiling
 
 ```
-profile: loaded 5302 files in 89.89986ms
-profile: query <empty> -> 50 matches in 1.115µs
-profile: query "rs" -> 25 matches in 581.573µs
-profile: query "main" -> 50 matches in 566.038µs
-profile: query "doc" -> 50 matches in 523.604µs
+profile: loaded 20000 files in 2.716906457s
+profile: query <empty> -> 50 matches in 2.205µs
+profile: query "rs" -> 50 matches in 3.154651ms
+profile: query "main" -> 50 matches in 2.768032ms
+profile: query "doc" -> 50 matches in 2.301986ms
 
 === Image Loading Profile ===
-profile: image "chrome-context-menu.png" -> 296x300 thumb in 14.5ms
-profile: image "istockphoto-1024x1024.jpg" -> 300x300 thumb in 15.0ms
-profile: image "small-icon-128.png" -> 128x128 thumb in 0.17ms
+profile: image "38_gray.png" -> 38x38 thumb in 2.7ms
+profile: image "icon-128.png" -> 599x600 thumb in 21.7ms
+profile: image "jcode-vs-claude-code.png" -> 800x562 thumb in 57.4ms
 
 === Cached Image Access ===
-profile: cold load in 11.6ms
-profile: hot cache access in 632ns
+profile: cold load in 135µs
+profile: hot cache access in 14µs
 ```
 
 ## Usage

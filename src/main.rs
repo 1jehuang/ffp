@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -16,13 +18,19 @@ use ratatui::{
 };
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, BufRead, BufReader, Write},
-    os::unix::fs::FileTypeExt,
-    path::Path,
+    os::unix::{
+        fs::{FileTypeExt, OpenOptionsExt},
+        io::AsRawFd,
+    },
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -33,12 +41,15 @@ use syntect::parsing::SyntaxSet;
 const MATCH_LIMIT: usize = 50;
 const FILE_BATCH_SIZE: usize = 256;
 const FILE_LOOKBACK_WINDOW: &str = "9d";
+const FILE_LOOKBACK_WINDOW_SECS: u64 = 9 * 24 * 60 * 60;
+const RECENT_POOL_LIMIT: usize = 20_000;
 const IMAGE_CACHE_SIZE: usize = 10;
 const THUMBNAIL_MAX_WIDTH: u32 = 800;
 const THUMBNAIL_MAX_HEIGHT: u32 = 600;
 const VIDEO_PREVIEW_FRAMES: usize = 75;
 const VIDEO_FRAME_INTERVAL_MS: u64 = 66;
 const VIDEO_CACHE_SIZE: usize = 5;
+const HISTORY_MAX_ENTRIES: usize = 5000;
 
 #[derive(Clone, Debug)]
 struct CachedImage {
@@ -87,6 +98,7 @@ impl<T> LruCache<T> {
 
 type ImageCache = LruCache<CachedImage>;
 type VideoCache = LruCache<Vec<CachedImage>>;
+type PendingVideoCache = Arc<Mutex<Option<(String, Vec<CachedImage>)>>>;
 
 struct FileEntry {
     path: String,
@@ -94,7 +106,133 @@ struct FileEntry {
     name_lower: String,
     dir: String,
     mtime: SystemTime,
+    recency_time: SystemTime,
+    recency_source: RecencySource,
     is_dir: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecencySource {
+    Modified,
+    Accessed,
+    FfpHistory,
+    DesktopRecent,
+}
+
+impl RecencySource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Modified => "mod",
+            Self::Accessed => "read",
+            Self::FfpHistory => "ffp",
+            Self::DesktopRecent => "desk",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecencyIndex {
+    ffp_history: HashMap<String, SystemTime>,
+    desktop_recent: HashMap<String, SystemTime>,
+    cwd: PathBuf,
+}
+
+impl RecencyIndex {
+    fn load() -> Self {
+        Self {
+            ffp_history: load_ffp_history(),
+            desktop_recent: load_desktop_recent(),
+            cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+
+    fn path_key(&self, path: &str) -> String {
+        normalized_path_key_with_cwd(path, &self.cwd)
+    }
+
+    fn candidate_paths(&self) -> Vec<String> {
+        let mut candidates: HashMap<String, SystemTime> = HashMap::new();
+        for (path, time) in self.ffp_history.iter().chain(self.desktop_recent.iter()) {
+            let entry = candidates.entry(path.clone()).or_insert(*time);
+            if *time > *entry {
+                *entry = *time;
+            }
+        }
+
+        let mut candidates: Vec<(String, SystemTime)> = candidates.into_iter().collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.into_iter().map(|(path, _)| path).collect()
+    }
+}
+
+fn recent_window() -> Duration {
+    Duration::from_secs(FILE_LOOKBACK_WINDOW_SECS)
+}
+
+fn is_within_recent_window(time: SystemTime) -> bool {
+    match SystemTime::now().duration_since(time) {
+        Ok(elapsed) => elapsed <= recent_window(),
+        Err(_) => true,
+    }
+}
+
+fn best_recency(
+    mtime: SystemTime,
+    atime: SystemTime,
+    history_time: Option<SystemTime>,
+    desktop_time: Option<SystemTime>,
+) -> (SystemTime, RecencySource) {
+    let mut best_time = mtime;
+    let mut best_source = RecencySource::Modified;
+
+    for (time, source) in [
+        (Some(atime), RecencySource::Accessed),
+        (desktop_time, RecencySource::DesktopRecent),
+        (history_time, RecencySource::FfpHistory),
+    ] {
+        if let Some(time) = time {
+            if time > best_time {
+                best_time = time;
+                best_source = source;
+            }
+        }
+    }
+
+    (best_time, best_source)
+}
+
+fn normalized_path_key(path: &str) -> String {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    normalized_path_key_with_cwd(path, &cwd)
+}
+
+fn normalized_path_key_with_cwd(path: &str, cwd: &Path) -> String {
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    normalize_path(&absolute).to_string_lossy().to_string()
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
 }
 
 #[derive(Clone)]
@@ -145,6 +283,9 @@ struct App {
     recent_files: Arc<Mutex<Vec<FileEntry>>>,
     all_files: Arc<Mutex<Vec<FileEntry>>>,
     dir_entries: Arc<Mutex<Vec<FileEntry>>>,
+    recent_version: Arc<AtomicU64>,
+    all_version: Arc<AtomicU64>,
+    dir_version: Arc<AtomicU64>,
     matches: Vec<MatchEntry>,
     matches_by_time: Vec<MatchEntry>,
     selected: usize,
@@ -155,6 +296,7 @@ struct App {
     search_scope: SearchScope,
     last_query: String,
     last_file_count: usize,
+    last_file_version: u64,
     last_scope: SearchScope,
     preview_path: String,
     preview_content: PreviewContent,
@@ -165,7 +307,8 @@ struct App {
     video_loader: Option<Arc<Mutex<Vec<CachedImage>>>>,
     video_loader_done: Option<Arc<Mutex<bool>>>,
     video_loader_path: String,
-    video_cache_pending: Arc<Mutex<Option<(String, Vec<CachedImage>)>>>,
+    video_cache_pending: PendingVideoCache,
+    recency_index: Arc<RecencyIndex>,
     syntax_set: SyntaxSet,
     theme: syntect::highlighting::Theme,
     drag_mode: bool,
@@ -177,9 +320,13 @@ impl App {
         let recent_files = Arc::new(Mutex::new(Vec::new()));
         let all_files = Arc::new(Mutex::new(Vec::new()));
         let dir_entries = Arc::new(Mutex::new(Vec::new()));
+        let recent_version = Arc::new(AtomicU64::new(0));
+        let all_version = Arc::new(AtomicU64::new(0));
+        let dir_version = Arc::new(AtomicU64::new(0));
         let recent_loading = Arc::new(Mutex::new(false));
         let all_loading = Arc::new(Mutex::new(false));
         let dir_loading = Arc::new(Mutex::new(false));
+        let recency_index = Arc::new(RecencyIndex::load());
         let search_scope = if dir_mode {
             SearchScope::All
         } else {
@@ -190,15 +337,19 @@ impl App {
             spawn_entry_loader(
                 Arc::clone(&dir_entries),
                 Arc::clone(&dir_loading),
+                Arc::clone(&dir_version),
                 dir_mode,
                 false,
+                Arc::clone(&recency_index),
             );
         } else {
             spawn_entry_loader(
                 Arc::clone(&recent_files),
                 Arc::clone(&recent_loading),
+                Arc::clone(&recent_version),
                 dir_mode,
                 true,
+                Arc::clone(&recency_index),
             );
         }
 
@@ -211,6 +362,9 @@ impl App {
             recent_files,
             all_files,
             dir_entries,
+            recent_version,
+            all_version,
+            dir_version,
             matches: Vec::new(),
             matches_by_time: Vec::new(),
             selected: 0,
@@ -221,6 +375,7 @@ impl App {
             search_scope,
             last_query: String::new(),
             last_file_count: 0,
+            last_file_version: u64::MAX,
             last_scope: search_scope,
             preview_path: String::new(),
             preview_content: PreviewContent::None,
@@ -232,6 +387,7 @@ impl App {
             video_loader_done: None,
             video_loader_path: String::new(),
             video_cache_pending: Arc::new(Mutex::new(None)),
+            recency_index,
             syntax_set,
             theme,
             drag_mode: false,
@@ -261,6 +417,17 @@ impl App {
         }
     }
 
+    fn version_for_scope(&self, scope: SearchScope) -> &Arc<AtomicU64> {
+        if self.dir_mode {
+            return &self.dir_version;
+        }
+
+        match scope {
+            SearchScope::Recent => &self.recent_version,
+            SearchScope::All => &self.all_version,
+        }
+    }
+
     fn active_scope(&self) -> SearchScope {
         if self.dir_mode {
             SearchScope::All
@@ -277,6 +444,7 @@ impl App {
         self.search_scope = self.search_scope.toggle();
         self.selected = 0;
         self.preview_path.clear();
+        self.last_file_version = u64::MAX;
 
         if self.search_scope == SearchScope::All {
             let needs_load = self.all_files.lock().unwrap().is_empty();
@@ -285,8 +453,10 @@ impl App {
                 spawn_entry_loader(
                     Arc::clone(&self.all_files),
                     Arc::clone(&self.all_loading),
+                    Arc::clone(&self.all_version),
                     self.dir_mode,
                     false,
+                    Arc::clone(&self.recency_index),
                 );
             }
         }
@@ -299,6 +469,7 @@ impl App {
         self.preview_content = PreviewContent::None;
         self.last_query.clear();
         self.last_file_count = 0;
+        self.last_file_version = u64::MAX;
 
         if self.dir_mode {
             let needs_load = self.dir_entries.lock().unwrap().is_empty();
@@ -307,8 +478,10 @@ impl App {
                 spawn_entry_loader(
                     Arc::clone(&self.dir_entries),
                     Arc::clone(&self.dir_loading),
+                    Arc::clone(&self.dir_version),
                     true,
                     false,
+                    Arc::clone(&self.recency_index),
                 );
             }
         } else {
@@ -322,8 +495,10 @@ impl App {
                 spawn_entry_loader(
                     Arc::clone(files),
                     Arc::clone(loading),
+                    Arc::clone(self.version_for_scope(scope)),
                     false,
                     scope == SearchScope::Recent,
+                    Arc::clone(&self.recency_index),
                 );
             }
         }
@@ -476,8 +651,10 @@ impl App {
     fn update_matches(&mut self) {
         let scope = self.active_scope();
         let files_len = self.files_for_scope(scope).lock().unwrap().len();
+        let file_version = self.version_for_scope(scope).load(AtomicOrdering::Relaxed);
         let query_changed = self.query != self.last_query;
-        let files_changed = files_len != self.last_file_count;
+        let files_changed =
+            files_len != self.last_file_count || file_version != self.last_file_version;
         let scope_changed = scope != self.last_scope;
 
         if !query_changed && !files_changed && !scope_changed {
@@ -488,12 +665,12 @@ impl App {
             let files = self.files_for_scope(scope).lock().unwrap();
             let matches = fuzzy_match(&self.query, &files, MATCH_LIMIT);
 
-            // Time-sorted column: same matches, sorted by mtime then score
+            // Recent column: same matches, sorted by combined recency then score.
             let mut matches_by_time = matches.clone();
             matches_by_time.sort_by(|a, b| {
                 files[b.index]
-                    .mtime
-                    .cmp(&files[a.index].mtime)
+                    .recency_time
+                    .cmp(&files[a.index].recency_time)
                     .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
             });
 
@@ -505,6 +682,7 @@ impl App {
 
         self.last_query = self.query.clone();
         self.last_file_count = files_len;
+        self.last_file_version = file_version;
         self.last_scope = scope;
         if self.selected >= self.matches.len() {
             self.selected = self.matches.len().saturating_sub(1);
@@ -537,6 +715,314 @@ impl App {
     }
 }
 
+fn history_file_path() -> Option<PathBuf> {
+    let state_dir =
+        dirs::state_dir().or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))?;
+    Some(state_dir.join("ffp").join("recent.tsv"))
+}
+
+fn load_ffp_history() -> HashMap<String, SystemTime> {
+    let mut history = HashMap::new();
+
+    for (path, time) in read_ffp_history_entries() {
+        let entry = history.entry(path).or_insert(time);
+        if time > *entry {
+            *entry = time;
+        }
+    }
+
+    history
+}
+
+fn read_ffp_history_entries() -> Vec<(String, SystemTime)> {
+    let Some(path) = history_file_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| {
+            let (secs, path) = line.split_once('\t')?;
+            let secs = secs.parse::<u64>().ok()?;
+            Some((unescape_history_path(path), unix_secs_to_system_time(secs)))
+        })
+        .collect()
+}
+
+fn record_file_interaction(path: &str) -> io::Result<()> {
+    let Some(history_path) = history_file_path() else {
+        return Ok(());
+    };
+
+    let key = normalized_path_key(path);
+    let now = SystemTime::now();
+    let mut history = load_ffp_history();
+    history.insert(key, now);
+
+    let mut entries: Vec<(String, SystemTime)> = history.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(HISTORY_MAX_ENTRIES);
+
+    if let Some(parent) = history_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = history_path.with_extension("tsv.tmp");
+    let mut body = String::new();
+    for (path, time) in entries {
+        body.push_str(&system_time_to_unix_secs(time).to_string());
+        body.push('\t');
+        body.push_str(&escape_history_path(&path));
+        body.push('\n');
+    }
+
+    fs::write(&tmp_path, body)?;
+    fs::rename(tmp_path, history_path)?;
+    Ok(())
+}
+
+fn system_time_to_unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn unix_secs_to_system_time(secs: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+fn escape_history_path(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn unescape_history_path(path: &str) -> String {
+    let mut unescaped = String::with_capacity(path.len());
+    let mut chars = path.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            unescaped.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('t') => unescaped.push('\t'),
+            Some('n') => unescaped.push('\n'),
+            Some('r') => unescaped.push('\r'),
+            Some('\\') => unescaped.push('\\'),
+            Some(other) => {
+                unescaped.push('\\');
+                unescaped.push(other);
+            }
+            None => unescaped.push('\\'),
+        }
+    }
+
+    unescaped
+}
+
+fn load_desktop_recent() -> HashMap<String, SystemTime> {
+    let Some(data_dir) = dirs::data_dir() else {
+        return HashMap::new();
+    };
+    let path = data_dir.join("recently-used.xbel");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    let mut recent = HashMap::new();
+    let mut offset = 0;
+
+    while let Some(pos) = contents[offset..].find("<bookmark") {
+        let start = offset + pos;
+        let Some(end_rel) = contents[start..].find('>') else {
+            break;
+        };
+        let tag = &contents[start..start + end_rel + 1];
+        offset = start + end_rel + 1;
+
+        let Some(href) = xml_attr(tag, "href") else {
+            continue;
+        };
+        let Some(path) = file_uri_to_path(&href) else {
+            continue;
+        };
+
+        let time = ["visited", "modified", "added"]
+            .into_iter()
+            .filter_map(|attr| xml_attr(tag, attr))
+            .filter_map(|value| parse_rfc3339_to_system_time(&value))
+            .max()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        let key = normalized_path_key(&path);
+        let entry = recent.entry(key).or_insert(time);
+        if time > *entry {
+            *entry = time;
+        }
+    }
+
+    recent
+}
+
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{}=", name);
+    let pos = tag.find(&needle)? + needle.len();
+    let quote = tag.as_bytes().get(pos).copied()?;
+    if quote != b'\'' && quote != b'\"' {
+        return None;
+    }
+    let rest = &tag[pos + 1..];
+    let end = rest.as_bytes().iter().position(|b| *b == quote)?;
+    Some(decode_xml_entities(&rest[..end]))
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn file_uri_to_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = if let Some(path) = rest.strip_prefix("localhost/") {
+        format!("/{}", path)
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        return None;
+    };
+
+    Some(percent_decode(&path))
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_rfc3339_to_system_time(value: &str) -> Option<SystemTime> {
+    let value = value.trim();
+    if value.len() < 20 {
+        return None;
+    }
+
+    let year = value.get(0..4)?.parse::<i32>().ok()?;
+    let month = value.get(5..7)?.parse::<u32>().ok()?;
+    let day = value.get(8..10)?.parse::<u32>().ok()?;
+    let hour = value.get(11..13)?.parse::<u32>().ok()?;
+    let minute = value.get(14..16)?.parse::<u32>().ok()?;
+    let second = value.get(17..19)?.parse::<u32>().ok()?;
+
+    if value.get(4..5)? != "-"
+        || value.get(7..8)? != "-"
+        || value.get(10..11)? != "T"
+        || value.get(13..14)? != ":"
+        || value.get(16..17)? != ":"
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    let mut tz_start = 19;
+    if value.as_bytes().get(tz_start) == Some(&b'.') {
+        tz_start += 1;
+        while value
+            .as_bytes()
+            .get(tz_start)
+            .map(|b| b.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            tz_start += 1;
+        }
+    }
+
+    let tz = value.get(tz_start..)?;
+    let offset_secs = if tz == "Z" || tz == "z" {
+        0
+    } else {
+        let sign = match tz.as_bytes().first().copied()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let hours = tz.get(1..3)?.parse::<i64>().ok()?;
+        let minutes = if tz.as_bytes().get(3) == Some(&b':') {
+            tz.get(4..6)?.parse::<i64>().ok()?
+        } else {
+            tz.get(3..5)?.parse::<i64>().ok()?
+        };
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        sign * (hours * 3600 + minutes * 60)
+    };
+
+    let days = days_from_civil(year, month, day);
+    let local_timestamp = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    let timestamp = local_timestamp - offset_secs;
+
+    if timestamp >= 0 {
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp as u64))
+    } else {
+        Some(SystemTime::UNIX_EPOCH - Duration::from_secs((-timestamp) as u64))
+    }
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146_097 + doe as i64 - 719_468
+}
+
 fn build_fd_args(dir_mode: bool, recent_only: bool) -> Vec<String> {
     let mut args = vec![
         ".".to_string(),
@@ -561,6 +1047,22 @@ fn build_fd_args(dir_mode: bool, recent_only: bool) -> Vec<String> {
         ".cache".to_string(),
         "-E".to_string(),
         ".npm".to_string(),
+        "-E".to_string(),
+        "target".to_string(),
+        "-E".to_string(),
+        "__pycache__".to_string(),
+        "-E".to_string(),
+        ".venv".to_string(),
+        "-E".to_string(),
+        "venv".to_string(),
+        "-E".to_string(),
+        ".cargo/registry".to_string(),
+        "-E".to_string(),
+        ".cargo/git".to_string(),
+        "-E".to_string(),
+        ".rustup".to_string(),
+        "-E".to_string(),
+        "go/pkg/mod".to_string(),
     ]);
 
     args
@@ -569,25 +1071,91 @@ fn build_fd_args(dir_mode: bool, recent_only: bool) -> Vec<String> {
 fn spawn_entry_loader(
     files: Arc<Mutex<Vec<FileEntry>>>,
     loading: Arc<Mutex<bool>>,
+    version: Arc<AtomicU64>,
     dir_mode: bool,
     recent_only: bool,
+    recency_index: Arc<RecencyIndex>,
 ) {
     *loading.lock().unwrap() = true;
     files.lock().unwrap().clear();
+    mark_entries_changed(&version);
 
     thread::spawn(move || {
-        load_entries(files, loading, dir_mode, recent_only);
+        load_entries(
+            files,
+            loading,
+            version,
+            dir_mode,
+            recent_only,
+            recency_index,
+        );
     });
 }
 
 fn load_entries(
     files: Arc<Mutex<Vec<FileEntry>>>,
     loading: Arc<Mutex<bool>>,
+    version: Arc<AtomicU64>,
     dir_mode: bool,
     recent_only: bool,
+    recency_index: Arc<RecencyIndex>,
 ) {
-    let args = build_fd_args(dir_mode, recent_only);
+    let mut seen = HashSet::new();
 
+    if recent_only && !dir_mode {
+        // Stage 1: paths we already know were recently opened by ffp or the desktop.
+        let mut buffer = Vec::new();
+        for path in recency_index.candidate_paths() {
+            push_entry_if_wanted(path, &files, &mut buffer, &mut seen, &recency_index, true);
+        }
+        flush_entry_buffer(&files, &mut buffer, &version, true);
+        sort_loaded_entries(&files, &version, true);
+
+        // Stage 2: the old fast path, modified recently according to fd.
+        load_fd_entries(
+            build_fd_args(false, true),
+            &files,
+            &version,
+            &recency_index,
+            &mut seen,
+            true,
+        );
+        sort_loaded_entries(&files, &version, true);
+
+        // Stage 3: broader background pass for access-time recency. This can take
+        // longer on large homes, but the UI is already usable from stages 1 and 2.
+        load_fd_entries(
+            build_fd_args(false, false),
+            &files,
+            &version,
+            &recency_index,
+            &mut seen,
+            true,
+        );
+    } else {
+        load_fd_entries(
+            build_fd_args(dir_mode, false),
+            &files,
+            &version,
+            &recency_index,
+            &mut seen,
+            false,
+        );
+    }
+
+    sort_loaded_entries(&files, &version, recent_only && !dir_mode);
+
+    *loading.lock().unwrap() = false;
+}
+
+fn load_fd_entries(
+    args: Vec<String>,
+    files: &Arc<Mutex<Vec<FileEntry>>>,
+    version: &AtomicU64,
+    recency_index: &RecencyIndex,
+    seen: &mut HashSet<String>,
+    recent_only: bool,
+) {
     let child = Command::new("fd")
         .args(&args)
         .stdout(Stdio::piped())
@@ -609,28 +1177,94 @@ fn load_entries(
                 }
 
                 let path = String::from_utf8_lossy(&line).to_string();
-                buffer.push(FileEntry::new(path));
+                push_entry_if_wanted(path, files, &mut buffer, seen, recency_index, recent_only);
 
                 if buffer.len() >= FILE_BATCH_SIZE {
-                    files.lock().unwrap().extend(buffer.drain(..));
+                    flush_entry_buffer(files, &mut buffer, version, recent_only);
                 }
             }
 
-            if !buffer.is_empty() {
-                files.lock().unwrap().extend(buffer);
-            }
+            flush_entry_buffer(files, &mut buffer, version, recent_only);
         }
         let _ = child.wait();
     }
+}
 
-    // Sort by mtime descending (most recent first)
-    files.lock().unwrap().sort_by(|a, b| b.mtime.cmp(&a.mtime));
+fn push_entry_if_wanted(
+    path: String,
+    _files: &Arc<Mutex<Vec<FileEntry>>>,
+    buffer: &mut Vec<FileEntry>,
+    seen: &mut HashSet<String>,
+    recency_index: &RecencyIndex,
+    recent_only: bool,
+) {
+    let key = recency_index.path_key(&path);
+    if seen.contains(&key) {
+        return;
+    }
 
-    *loading.lock().unwrap() = false;
+    let Some(entry) = FileEntry::try_new_with_recency(path, recency_index) else {
+        return;
+    };
+
+    if recent_only && !is_within_recent_window(entry.recency_time) {
+        return;
+    }
+
+    seen.insert(key);
+    buffer.push(entry);
+}
+
+fn flush_entry_buffer(
+    files: &Arc<Mutex<Vec<FileEntry>>>,
+    buffer: &mut Vec<FileEntry>,
+    version: &AtomicU64,
+    cap_recent_pool: bool,
+) {
+    if !buffer.is_empty() {
+        let mut files = files.lock().unwrap();
+        files.extend(buffer.drain(..));
+        if cap_recent_pool && files.len() > RECENT_POOL_LIMIT * 2 {
+            files.sort_by(compare_entries_by_recency);
+            files.truncate(RECENT_POOL_LIMIT);
+        }
+        mark_entries_changed(version);
+    }
+}
+
+fn sort_loaded_entries(
+    files: &Arc<Mutex<Vec<FileEntry>>>,
+    version: &AtomicU64,
+    cap_recent_pool: bool,
+) {
+    let mut files = files.lock().unwrap();
+    files.sort_by(compare_entries_by_recency);
+    if cap_recent_pool {
+        files.truncate(RECENT_POOL_LIMIT);
+    }
+    mark_entries_changed(version);
+}
+
+fn mark_entries_changed(version: &AtomicU64) {
+    version.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+fn compare_entries_by_recency(a: &FileEntry, b: &FileEntry) -> Ordering {
+    b.recency_time
+        .cmp(&a.recency_time)
+        .then_with(|| b.mtime.cmp(&a.mtime))
+        .then_with(|| a.name_lower.cmp(&b.name_lower))
 }
 
 fn load_files(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>) {
-    load_entries(files, loading, false, true);
+    load_entries(
+        files,
+        loading,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        true,
+        Arc::new(RecencyIndex::load()),
+    );
 }
 
 fn basename(path: &str) -> &str {
@@ -648,15 +1282,41 @@ fn dirname(path: &str) -> &str {
 }
 
 impl FileEntry {
+    #[cfg(test)]
     fn new(path: String) -> Self {
+        Self::new_with_recency(path, &RecencyIndex::default())
+    }
+
+    fn try_new_with_recency(path: String, recency_index: &RecencyIndex) -> Option<Self> {
+        let metadata = fs::metadata(&path).ok()?;
+        Some(Self::from_metadata(path, Some(&metadata), recency_index))
+    }
+
+    #[cfg(test)]
+    fn new_with_recency(path: String, recency_index: &RecencyIndex) -> Self {
+        let metadata = fs::metadata(&path).ok();
+        Self::from_metadata(path, metadata.as_ref(), recency_index)
+    }
+
+    fn from_metadata(
+        path: String,
+        metadata: Option<&fs::Metadata>,
+        recency_index: &RecencyIndex,
+    ) -> Self {
         let name = basename(&path).to_string();
         let dir = dirname(&path).to_string();
         let name_lower = name.to_lowercase();
-        let metadata = fs::metadata(&path).ok();
-        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = metadata.map(|m| m.is_dir()).unwrap_or(false);
         let mtime = metadata
             .and_then(|m| m.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
+        let atime = metadata
+            .and_then(|m| m.accessed().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let key = recency_index.path_key(&path);
+        let history_time = recency_index.ffp_history.get(&key).copied();
+        let desktop_time = recency_index.desktop_recent.get(&key).copied();
+        let (recency_time, recency_source) = best_recency(mtime, atime, history_time, desktop_time);
 
         Self {
             path,
@@ -664,6 +1324,8 @@ impl FileEntry {
             name_lower,
             dir,
             mtime,
+            recency_time,
+            recency_source,
             is_dir,
         }
     }
@@ -709,6 +1371,27 @@ fn read_directory_preview(path: &str, max_lines: usize) -> Vec<String> {
     lines
 }
 
+fn open_noatime_file(path: &str) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOATIME)
+        .open(path)
+}
+
+fn open_preview_file(path: &str) -> io::Result<fs::File> {
+    open_noatime_file(path).or_else(|_| fs::File::open(path))
+}
+
+fn with_noatime_path<T>(path: &str, f: impl FnOnce(&str) -> T) -> T {
+    match open_noatime_file(path) {
+        Ok(file) => {
+            let proc_path = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
+            f(&proc_path)
+        }
+        Err(_) => f(path),
+    }
+}
+
 fn plain_preview(lines: Vec<String>) -> Vec<Line<'static>> {
     lines
         .into_iter()
@@ -730,7 +1413,7 @@ fn read_preview(path: &str, max_lines: usize) -> Vec<String> {
         return read_directory_preview(path, max_lines);
     }
 
-    let file = match fs::File::open(path) {
+    let file = match open_preview_file(path) {
         Ok(f) => f,
         Err(_) => return vec!["[Cannot read file]".to_string()],
     };
@@ -798,41 +1481,45 @@ fn is_video_file(path: &str) -> bool {
 }
 
 fn get_video_duration(path: &str) -> Option<f64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "csv=p=0",
-            path,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = with_noatime_path(path, |input_path| {
+        Command::new("ffprobe")
+            .args([
+                "-v",
+                "quiet",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                input_path,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+    })?;
     let s = String::from_utf8_lossy(&output.stdout);
     s.trim().parse::<f64>().ok()
 }
 
 fn get_video_dimensions(path: &str) -> Option<(u32, u32)> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0:s=x",
-            path,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = with_noatime_path(path, |input_path| {
+        Command::new("ffprobe")
+            .args([
+                "-v",
+                "quiet",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                input_path,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+    })?;
     let s = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = s.trim().split('x').collect();
     if parts.len() == 2 {
@@ -864,64 +1551,66 @@ fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
         fps, out_w, out_h, out_w, out_h
     );
 
-    let mut child = match Command::new("ffmpeg")
-        .args([
-            "-i",
-            path,
-            "-vf",
-            &scale_filter,
-            "-frames:v",
-            &VIDEO_PREVIEW_FRAMES.to_string(),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => return,
-    };
-
-    let mut reader = BufReader::with_capacity(256 * 1024, stdout);
-    let mut buf = Vec::with_capacity(frame_size * 2);
-    let mut frame_count = 0;
-
-    loop {
-        let mut tmp = [0u8; 65536];
-        let n = match io::Read::read(&mut reader, &mut tmp) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
+    with_noatime_path(path, |input_path| {
+        let mut child = match Command::new("ffmpeg")
+            .args([
+                "-i",
+                input_path,
+                "-vf",
+                &scale_filter,
+                "-frames:v",
+                &VIDEO_PREVIEW_FRAMES.to_string(),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
         };
-        buf.extend_from_slice(&tmp[..n]);
 
-        while buf.len() >= frame_size {
-            let raw_frame: Vec<u8> = buf.drain(..frame_size).collect();
-            shared.lock().unwrap().push(CachedImage {
-                data: raw_frame,
-                width: out_w,
-                height: out_h,
-                is_raw_rgb: true,
-            });
-            frame_count += 1;
-            if frame_count >= VIDEO_PREVIEW_FRAMES {
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut reader = BufReader::with_capacity(256 * 1024, stdout);
+        let mut buf = Vec::with_capacity(frame_size * 2);
+        let mut frame_count = 0;
+
+        loop {
+            let mut tmp = [0u8; 65536];
+            let n = match io::Read::read(&mut reader, &mut tmp) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+
+            while buf.len() >= frame_size {
+                let raw_frame: Vec<u8> = buf.drain(..frame_size).collect();
+                shared.lock().unwrap().push(CachedImage {
+                    data: raw_frame,
+                    width: out_w,
+                    height: out_h,
+                    is_raw_rgb: true,
+                });
+                frame_count += 1;
+                if frame_count >= VIDEO_PREVIEW_FRAMES {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
             }
         }
-    }
 
-    let _ = child.wait();
+        let _ = child.wait();
+    });
 }
 
 fn time_ago(mtime: SystemTime) -> String {
@@ -982,7 +1671,12 @@ fn highlight_preview(
 }
 
 fn load_thumbnail(path: &str) -> Option<CachedImage> {
-    let img = image::open(path).ok()?;
+    let file = open_preview_file(path).ok()?;
+    let img = image::ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
 
     // Calculate thumbnail size maintaining aspect ratio
     let (orig_w, orig_h) = img.dimensions();
@@ -1737,6 +2431,68 @@ mod tests {
     }
 
     #[test]
+    fn recency_prefers_ffp_history_over_filesystem_times() {
+        let file = unique_temp_path("history-recency.txt");
+        fs::write(&file, "hello").unwrap();
+
+        let path = file.to_string_lossy().to_string();
+        let history_time = SystemTime::now() + Duration::from_secs(60);
+        let mut recency_index = RecencyIndex::default();
+        recency_index
+            .ffp_history
+            .insert(normalized_path_key(&path), history_time);
+
+        let entry = FileEntry::new_with_recency(path, &recency_index);
+        assert_eq!(entry.recency_time, history_time);
+        assert_eq!(entry.recency_source, RecencySource::FfpHistory);
+
+        fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn recency_window_filters_old_times() {
+        assert!(is_within_recent_window(SystemTime::now()));
+        assert!(!is_within_recent_window(
+            SystemTime::now() - Duration::from_secs(FILE_LOOKBACK_WINDOW_SECS + 60)
+        ));
+    }
+
+    #[test]
+    fn history_path_escaping_round_trips() {
+        let path = "/tmp/ffp path/with\\slashes\tand\nnewlines.txt";
+        assert_eq!(unescape_history_path(&escape_history_path(path)), path);
+    }
+
+    #[test]
+    fn desktop_file_uri_decoding_handles_percent_encoding() {
+        assert_eq!(
+            file_uri_to_path("file:///home/jeremy/a%20b%23c.txt").as_deref(),
+            Some("/home/jeremy/a b#c.txt")
+        );
+        assert_eq!(
+            file_uri_to_path("file://localhost/tmp/hello.txt").as_deref(),
+            Some("/tmp/hello.txt")
+        );
+        assert!(file_uri_to_path("file://other-host/tmp/hello.txt").is_none());
+    }
+
+    #[test]
+    fn rfc3339_parser_handles_utc_and_offsets() {
+        assert_eq!(
+            parse_rfc3339_to_system_time("1970-01-01T00:00:00Z"),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+        assert_eq!(
+            parse_rfc3339_to_system_time("1970-01-01T01:00:00+01:00"),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+        assert_eq!(
+            parse_rfc3339_to_system_time("1969-12-31T23:00:00-01:00"),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+    }
+
+    #[test]
     fn file_entry_marks_directories() {
         let dir = unique_temp_path("dir-entry");
         fs::create_dir_all(&dir).unwrap();
@@ -2442,16 +3198,12 @@ mod tests {
             let last_show = before.rfind("\x1b[?25h");
             let last_hide = before.rfind("\x1b[?25l");
 
-            if let Some(show_pos) = last_show {
-                if let Some(hide_pos) = last_hide {
-                    assert!(
-                        show_pos > hide_pos || true,
-                        "cursor state tracking: show at {}, hide at {} before kitty at {}",
-                        show_pos,
-                        hide_pos,
-                        kpos
-                    );
-                }
+            if let (Some(show_pos), Some(hide_pos)) = (last_show, last_hide) {
+                // This simulation primarily asserts that kitty frames render and
+                // the cursor is eventually restored. Keep this diagnostic value
+                // available for debugging cursor-order regressions without
+                // failing on terminal-sequence interleavings that are valid.
+                let _cursor_was_shown_after_last_hide = show_pos > hide_pos;
             }
         }
 
@@ -2555,7 +3307,8 @@ fn build_file_items<'a>(matches: &[MatchEntry], files: &[FileEntry]) -> Vec<List
             } else {
                 get_icon(fname)
             };
-            let time = time_ago(entry.mtime);
+            let time = time_ago(entry.recency_time);
+            let time_label = format!("{} {}", time, entry.recency_source.label());
 
             // Split filename into stem and extension
             let (stem, ext_part) = if entry.is_dir {
@@ -2579,7 +3332,7 @@ fn build_file_items<'a>(matches: &[MatchEntry], files: &[FileEntry]) -> Vec<List
                 ),
                 Span::styled(ext_part, Style::default().fg(icon_color)),
                 Span::styled(
-                    format!(" {}", time),
+                    format!(" {}", time_label),
                     Style::default().fg(Color::Rgb(80, 80, 80)),
                 ),
                 Span::raw(" "),
@@ -3574,11 +4327,16 @@ fn main() -> io::Result<()> {
                 (path, r)
             }
         };
-        if let Err(e) = result {
-            let _ = notify_rust::Notification::new()
-                .summary("File Picker")
-                .body(&format!("{}: {}", path, e))
-                .show();
+        match result {
+            Ok(()) => {
+                let _ = record_file_interaction(&path);
+            }
+            Err(e) => {
+                let _ = notify_rust::Notification::new()
+                    .summary("File Picker")
+                    .body(&format!("{}: {}", path, e))
+                    .show();
+            }
         }
     }
 
