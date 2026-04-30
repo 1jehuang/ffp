@@ -39,6 +39,10 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
 const MATCH_LIMIT: usize = 50;
+const MATCH_CANDIDATE_LIMIT: usize = 1024;
+const MATCH_QUERY_CACHE_SIZE: usize = 32;
+const INCREMENTAL_QUERY_MIN_CHARS: usize = 3;
+const INCREMENTAL_ACCEPT_MIN_MATCHES: usize = 8;
 const FILE_BATCH_SIZE: usize = 256;
 const FILE_LOOKBACK_WINDOW: &str = "9d";
 const FILE_LOOKBACK_WINDOW_SECS: u64 = 9 * 24 * 60 * 60;
@@ -93,6 +97,11 @@ impl<T> LruCache<T> {
         }
         self.order.push(path.clone());
         self.cache.insert(path, value);
+    }
+
+    fn clear(&mut self) {
+        self.cache.clear();
+        self.order.clear();
     }
 }
 
@@ -242,6 +251,42 @@ struct MatchEntry {
     score: f64,
 }
 
+struct MatchSearchState {
+    cache: LruCache<Vec<usize>>,
+    last_query: String,
+    last_scope: SearchScope,
+    last_file_version: u64,
+    last_file_count: usize,
+    last_candidates: Vec<usize>,
+}
+
+impl MatchSearchState {
+    fn new(scope: SearchScope) -> Self {
+        Self {
+            cache: LruCache::new(MATCH_QUERY_CACHE_SIZE),
+            last_query: String::new(),
+            last_scope: scope,
+            last_file_version: u64::MAX,
+            last_file_count: 0,
+            last_candidates: Vec::new(),
+        }
+    }
+
+    fn reset_if_stale(&mut self, scope: SearchScope, file_version: u64, file_count: usize) {
+        if self.last_scope != scope
+            || self.last_file_version != file_version
+            || self.last_file_count != file_count
+        {
+            self.cache.clear();
+            self.last_query.clear();
+            self.last_candidates.clear();
+            self.last_scope = scope;
+            self.last_file_version = file_version;
+            self.last_file_count = file_count;
+        }
+    }
+}
+
 enum PreviewContent {
     Text(Vec<Line<'static>>),
     Image(CachedImage),
@@ -289,6 +334,7 @@ struct App {
     dir_version: Arc<AtomicU64>,
     matches: Vec<MatchEntry>,
     matches_by_time: Vec<MatchEntry>,
+    match_search: MatchSearchState,
     selected: usize,
     active_column: usize, // 0 = ranked, 1 = recent
     recent_loading: Arc<Mutex<bool>>,
@@ -308,6 +354,7 @@ struct App {
     video_loader: Option<Arc<Mutex<Vec<CachedImage>>>>,
     video_loader_done: Option<Arc<Mutex<bool>>>,
     video_loader_path: String,
+    video_loader_seen_frames: usize,
     video_cache_pending: PendingVideoCache,
     recency_index: Arc<RecencyIndex>,
     syntax_set: SyntaxSet,
@@ -368,6 +415,7 @@ impl App {
             dir_version,
             matches: Vec::new(),
             matches_by_time: Vec::new(),
+            match_search: MatchSearchState::new(search_scope),
             selected: 0,
             active_column: 0,
             recent_loading,
@@ -387,6 +435,7 @@ impl App {
             video_loader: None,
             video_loader_done: None,
             video_loader_path: String::new(),
+            video_loader_seen_frames: 0,
             video_cache_pending: Arc::new(Mutex::new(None)),
             recency_index,
             syntax_set,
@@ -521,8 +570,13 @@ impl App {
                     .as_ref()
                     .map(|d| *d.lock().unwrap())
                     .unwrap_or(false);
-                if !frames.is_empty() {
+                let frame_count = frames.len();
+                if frame_count > 0 {
+                    if !done && frame_count == self.video_loader_seen_frames {
+                        return;
+                    }
                     let new_frames = frames.clone();
+                    self.video_loader_seen_frames = frame_count;
                     drop(frames);
                     if done {
                         let cache_path = current_path.clone();
@@ -558,6 +612,7 @@ impl App {
                         });
                         self.video_loader = None;
                         self.video_loader_done = None;
+                        self.video_loader_seen_frames = 0;
                         self.preview_content = PreviewContent::Video(new_frames);
                     } else {
                         self.preview_content = PreviewContent::VideoStreaming(new_frames);
@@ -566,6 +621,7 @@ impl App {
                     drop(frames);
                     self.video_loader = None;
                     self.video_loader_done = None;
+                    self.video_loader_seen_frames = 0;
                     self.preview_content = PreviewContent::Text(vec![Line::from(Span::styled(
                         "[Cannot load video]",
                         Style::default().fg(Color::DarkGray),
@@ -581,6 +637,7 @@ impl App {
             self.video_loader = None;
             self.video_loader_done = None;
             self.video_loader_path.clear();
+            self.video_loader_seen_frames = 0;
         }
 
         if current_path.is_empty() {
@@ -593,6 +650,7 @@ impl App {
             if let Some(cached_frames) = self.video_cache.get(&current_path) {
                 self.video_frame = 0;
                 self.video_frame_time = Instant::now();
+                self.video_loader_seen_frames = 0;
                 self.preview_content = PreviewContent::Video(cached_frames.clone());
                 return;
             }
@@ -609,6 +667,7 @@ impl App {
             self.video_loader_done = Some(shared_done);
             self.video_loader_path = current_path.clone();
             self.video_frame = 0;
+            self.video_loader_seen_frames = 0;
             self.preview_content = PreviewContent::VideoLoading;
         } else if is_image_file(&current_path) {
             // Check cache first
@@ -663,8 +722,17 @@ impl App {
         }
 
         let (matches, matches_by_time) = {
-            let files = self.files_for_scope(scope).lock().unwrap();
-            let matches = fuzzy_match(&self.query, &files, MATCH_LIMIT);
+            let files_arc = Arc::clone(self.files_for_scope(scope));
+            let files = files_arc.lock().unwrap();
+            self.match_search
+                .reset_if_stale(scope, file_version, files_len);
+            let matches = fuzzy_match_incremental(
+                &self.query,
+                &files,
+                MATCH_LIMIT,
+                MATCH_CANDIDATE_LIMIT,
+                &mut self.match_search,
+            );
 
             // Recent column: same matches, sorted by combined recency then score.
             let mut matches_by_time = matches.clone();
@@ -1950,12 +2018,22 @@ struct TypoWordMatch {
 }
 
 fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry> {
+    fuzzy_match_with_candidates(query, files, limit, limit).0
+}
+
+fn fuzzy_match_incremental(
+    query: &str,
+    files: &[FileEntry],
+    limit: usize,
+    candidate_limit: usize,
+    state: &mut MatchSearchState,
+) -> Vec<MatchEntry> {
     if limit == 0 {
         return Vec::new();
     }
 
     if query.is_empty() {
-        return files
+        let matches: Vec<MatchEntry> = files
             .iter()
             .enumerate()
             .take(limit)
@@ -1964,27 +2042,211 @@ fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry
                 score: 100.0,
             })
             .collect();
+        state.last_query.clear();
+        state.last_candidates = (0..files.len().min(candidate_limit)).collect();
+        return matches;
+    }
+
+    if let Some(cached) = state.cache.get(query) {
+        let matches = score_candidate_indexes(query, files, cached, limit, candidate_limit).0;
+        state.last_query = query.to_string();
+        state.last_candidates = cached.clone();
+        return matches;
+    }
+
+    if query.chars().count() >= INCREMENTAL_QUERY_MIN_CHARS
+        && query.starts_with(&state.last_query)
+        && !state.last_query.is_empty()
+        && !state.last_candidates.is_empty()
+    {
+        let (matches, candidates) =
+            score_candidate_indexes(query, files, &state.last_candidates, limit, candidate_limit);
+        if matches.len() >= INCREMENTAL_ACCEPT_MIN_MATCHES {
+            state.cache.insert(query.to_string(), candidates.clone());
+            state.last_query = query.to_string();
+            state.last_candidates = candidates;
+            return matches;
+        }
+    }
+
+    let (matches, candidates) = fuzzy_match_with_candidates(query, files, limit, candidate_limit);
+    state.cache.insert(query.to_string(), candidates.clone());
+    state.last_query = query.to_string();
+    state.last_candidates = candidates;
+    matches
+}
+
+fn fuzzy_match_with_candidates(
+    query: &str,
+    files: &[FileEntry],
+    limit: usize,
+    candidate_limit: usize,
+) -> (Vec<MatchEntry>, Vec<usize>) {
+    if limit == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    if query.is_empty() {
+        let matches: Vec<MatchEntry> = files
+            .iter()
+            .enumerate()
+            .take(limit)
+            .map(|(index, _)| MatchEntry {
+                index,
+                score: 100.0,
+            })
+            .collect();
+        let candidates = (0..files.len().min(candidate_limit)).collect();
+        return (matches, candidates);
+    }
+
+    score_all_files(query, files, limit, candidate_limit)
+}
+
+fn score_all_files(
+    query: &str,
+    files: &[FileEntry],
+    limit: usize,
+    candidate_limit: usize,
+) -> (Vec<MatchEntry>, Vec<usize>) {
+    if limit == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+    let query_compact: String = query_lower
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let query_char_count = query_compact.chars().count();
+    let mut results = Vec::new();
+    let mut warm_candidates = Vec::new();
+
+    for (index, entry) in files.iter().enumerate() {
+        if let Some(score) = file_match_score(&query_lower, &query_words, entry) {
+            results.push(MatchEntry { index, score });
+        }
+
+        if warm_candidates.len() < candidate_limit
+            && is_incremental_warm_candidate(&query_compact, query_char_count, &query_words, entry)
+        {
+            warm_candidates.push(index);
+        }
+    }
+
+    let (matches, candidates) = trim_sort_matches(results, limit, candidate_limit);
+    let candidates = merge_candidate_pool(candidates, warm_candidates, candidate_limit);
+    (matches, candidates)
+}
+
+fn score_candidate_indexes(
+    query: &str,
+    files: &[FileEntry],
+    indexes: &[usize],
+    limit: usize,
+    candidate_limit: usize,
+) -> (Vec<MatchEntry>, Vec<usize>) {
+    if limit == 0 {
+        return (Vec::new(), Vec::new());
     }
 
     let query_lower = query.to_lowercase();
     let query_words: Vec<&str> = query_lower.split_whitespace().collect();
     let mut results = Vec::new();
 
-    for (index, entry) in files.iter().enumerate() {
+    for &index in indexes {
+        let Some(entry) = files.get(index) else {
+            continue;
+        };
         if let Some(score) = file_match_score(&query_lower, &query_words, entry) {
             results.push(MatchEntry { index, score });
         }
     }
 
-    if results.len() > limit {
-        results.select_nth_unstable_by(limit, |a, b| {
+    let (matches, candidates) = trim_sort_matches(results, limit, candidate_limit);
+    let candidates = merge_candidate_pool(candidates, indexes.iter().copied(), candidate_limit);
+    (matches, candidates)
+}
+
+fn merge_candidate_pool(
+    mut candidates: Vec<usize>,
+    fallback: impl IntoIterator<Item = usize>,
+    candidate_limit: usize,
+) -> Vec<usize> {
+    if candidates.len() >= candidate_limit {
+        candidates.truncate(candidate_limit);
+        return candidates;
+    }
+
+    let mut seen: HashSet<usize> = candidates.iter().copied().collect();
+    for index in fallback {
+        if seen.insert(index) {
+            candidates.push(index);
+            if candidates.len() >= candidate_limit {
+                break;
+            }
+        }
+    }
+
+    candidates
+}
+
+fn is_incremental_warm_candidate(
+    query_compact: &str,
+    query_char_count: usize,
+    query_words: &[&str],
+    entry: &FileEntry,
+) -> bool {
+    if query_compact.is_empty() {
+        return true;
+    }
+
+    // Short prefixes often do not score high enough to be visible yet, but they
+    // are exactly the state we want to reuse while the user continues typing.
+    if query_char_count <= 2 {
+        return chars_in_order(query_compact, &entry.name_lower)
+            || chars_in_order(query_compact, &entry.path_lower);
+    }
+
+    if query_words.iter().any(|word| {
+        word.chars().count() >= 2
+            && (entry.name_lower.contains(word) || entry.path_lower.contains(word))
+    }) {
+        return true;
+    }
+
+    // Keep this bounded to typo-sized prefixes. Long queries should be narrowed
+    // by the scored candidate list instead of a broad subsequence filter.
+    query_char_count <= 6
+        && (chars_in_order(query_compact, &entry.name_lower)
+            || chars_in_order(query_compact, &entry.path_lower))
+}
+
+fn chars_in_order(needle: &str, haystack: &str) -> bool {
+    let mut haystack = haystack.chars();
+    needle
+        .chars()
+        .all(|needle_ch| haystack.any(|hay_ch| hay_ch == needle_ch))
+}
+
+fn trim_sort_matches(
+    mut results: Vec<MatchEntry>,
+    limit: usize,
+    candidate_limit: usize,
+) -> (Vec<MatchEntry>, Vec<usize>) {
+    let keep = candidate_limit.max(limit).min(results.len());
+    if keep > 0 && results.len() > keep {
+        results.select_nth_unstable_by(keep, |a, b| {
             b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
         });
-        results.truncate(limit);
+        results.truncate(keep);
     }
 
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-    results
+    let candidates = results.iter().map(|matched| matched.index).collect();
+    results.truncate(limit);
+    (results, candidates)
 }
 
 fn file_match_score(query_lower: &str, query_words: &[&str], entry: &FileEntry) -> Option<f64> {
@@ -2547,6 +2809,33 @@ fn run_profile() -> io::Result<()> {
         );
     }
 
+    let type_sequence =
+        env::var("FFP_PROFILE_TYPE_SEQUENCE").unwrap_or_else(|_| "m,ma,mai,main".to_string());
+    let mut match_state = MatchSearchState::new(SearchScope::Recent);
+    match_state.reset_if_stale(SearchScope::Recent, 0, file_count);
+    eprintln!("\n=== Incremental Typing Profile ===");
+    for query in type_sequence
+        .split(',')
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        let start = Instant::now();
+        let matches = fuzzy_match_incremental(
+            query,
+            &files,
+            MATCH_LIMIT,
+            MATCH_CANDIDATE_LIMIT,
+            &mut match_state,
+        );
+        eprintln!(
+            "profile: incremental query {:?} -> {} matches, {} candidates in {:?}",
+            query,
+            matches.len(),
+            match_state.last_candidates.len(),
+            start.elapsed()
+        );
+    }
+
     // Profile image loading
     eprintln!("\n=== Image Loading Profile ===");
     let image_files: Vec<_> = files
@@ -2844,6 +3133,42 @@ mod tests {
         let matches = fuzzy_match("rs", &files, 10);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].index, 0);
+    }
+
+    #[test]
+    fn fuzzy_match_incremental_reuses_candidate_pool_for_extended_queries() {
+        let mut files: Vec<FileEntry> = (0..64)
+            .map(|i| FileEntry::new(format!("noise-{i}.txt")))
+            .collect();
+        files.push(FileEntry::new("main.rs".to_string()));
+        files.push(FileEntry::new("maintainer-notes.md".to_string()));
+
+        let mut state = MatchSearchState::new(SearchScope::Recent);
+        state.reset_if_stale(SearchScope::Recent, 1, files.len());
+
+        let _ = fuzzy_match_incremental("mi", &files, 10, 16, &mut state);
+        assert!(!state.last_candidates.is_empty());
+        assert!(state.last_candidates.len() <= 16);
+
+        let matches = fuzzy_match_incremental("mian", &files, 10, 16, &mut state);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "main.rs");
+        assert_eq!(state.last_query, "mian");
+    }
+
+    #[test]
+    fn fuzzy_match_incremental_cache_handles_repeated_query() {
+        let files = vec![
+            FileEntry::new("main.rs".to_string()),
+            FileEntry::new("document.pdf".to_string()),
+        ];
+        let mut state = MatchSearchState::new(SearchScope::Recent);
+        state.reset_if_stale(SearchScope::Recent, 1, files.len());
+
+        let first = fuzzy_match_incremental("documnt", &files, 10, 16, &mut state);
+        let second = fuzzy_match_incremental("documnt", &files, 10, 16, &mut state);
+        assert_eq!(first.len(), second.len());
+        assert_eq!(files[second[0].index].name, "document.pdf");
     }
 
     #[test]
