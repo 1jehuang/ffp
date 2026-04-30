@@ -3414,17 +3414,6 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
             _ => " Preview ",
         }
     };
-    let preview = Paragraph::new(preview_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-            .title(Span::styled(
-                preview_title,
-                Style::default().fg(Color::Yellow),
-            )),
-    );
-
     // Status line
     let status = format!(
         "{} matches{} | {} {} | pool: {}{}{}",
@@ -3561,7 +3550,13 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         );
         frame.render_widget(status_widget, left_chunks[2]);
         frame.render_widget(help_widget, left_chunks[3]);
-        frame.render_widget(preview, main_chunks[1]);
+        render_preview_widget(
+            frame,
+            main_chunks[1],
+            &preview_lines,
+            needs_graphics,
+            preview_title,
+        );
 
         let cursor_pos = (
             left_chunks[0].x + app.query.len() as u16 + 1,
@@ -3598,7 +3593,13 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         );
         frame.render_widget(status_widget, left_chunks[2]);
         frame.render_widget(help_widget, left_chunks[3]);
-        frame.render_widget(preview, main_chunks[1]);
+        render_preview_widget(
+            frame,
+            main_chunks[1],
+            &preview_lines,
+            needs_graphics,
+            preview_title,
+        );
 
         let cursor_pos = (
             left_chunks[0].x + app.query.len() as u16 + 1,
@@ -3629,7 +3630,13 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
             chunks[1],
             &mut score_state,
         );
-        frame.render_widget(preview, chunks[2]);
+        render_preview_widget(
+            frame,
+            chunks[2],
+            &preview_lines,
+            needs_graphics,
+            preview_title,
+        );
         frame.render_widget(status_widget, chunks[3]);
         frame.render_widget(help_widget, chunks[4]);
 
@@ -3643,6 +3650,35 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         (Some(preview_area), cursor_pos)
     } else {
         (None, cursor_pos)
+    }
+}
+
+fn render_preview_widget(
+    frame: &mut Frame,
+    area: Rect,
+    preview_lines: &[Line],
+    needs_graphics: bool,
+    preview_title: &str,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+        .title(Span::styled(
+            preview_title.to_string(),
+            Style::default().fg(Color::Yellow),
+        ));
+
+    if needs_graphics {
+        // Do not render an empty Paragraph for image/video previews. Paragraph
+        // fills the inner preview area with spaces on every TUI draw; for video
+        // that happens every ~16ms, creating a visible blank interval before the
+        // next kitty graphics frame is transmitted. Drawing only the border
+        // leaves the previous graphics frame visible until it is atomically
+        // replaced by the next one.
+        frame.render_widget(block, area);
+    } else {
+        frame.render_widget(Paragraph::new(preview_lines.to_vec()).block(block), area);
     }
 }
 
