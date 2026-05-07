@@ -29,7 +29,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -109,6 +109,7 @@ type ImageCache = LruCache<CachedImage>;
 type VideoCache = LruCache<Vec<CachedImage>>;
 type PendingVideoCache = Arc<Mutex<Option<(String, Vec<CachedImage>)>>>;
 
+#[derive(Clone)]
 struct FileEntry {
     path: String,
     path_lower: String,
@@ -251,6 +252,24 @@ struct MatchEntry {
     score: f64,
 }
 
+struct SearchRequest {
+    id: u64,
+    query: String,
+    scope: SearchScope,
+    file_version: u64,
+    files: Vec<FileEntry>,
+}
+
+struct SearchResult {
+    id: u64,
+    query: String,
+    scope: SearchScope,
+    file_version: u64,
+    file_count: usize,
+    matches: Vec<MatchEntry>,
+    matches_by_time: Vec<MatchEntry>,
+}
+
 struct MatchSearchState {
     cache: LruCache<Vec<usize>>,
     last_query: String,
@@ -334,7 +353,10 @@ struct App {
     dir_version: Arc<AtomicU64>,
     matches: Vec<MatchEntry>,
     matches_by_time: Vec<MatchEntry>,
-    match_search: MatchSearchState,
+    search_tx: mpsc::Sender<SearchRequest>,
+    search_rx: mpsc::Receiver<SearchResult>,
+    next_search_id: u64,
+    latest_search_id: u64,
     selected: usize,
     active_column: usize, // 0 = ranked, 1 = recent
     recent_loading: Arc<Mutex<bool>>,
@@ -401,6 +423,8 @@ impl App {
             );
         }
 
+        let (search_tx, search_rx) = spawn_search_worker(search_scope);
+
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let mut ts = ThemeSet::load_defaults();
         let theme = ts.themes.remove("base16-ocean.dark").unwrap();
@@ -415,7 +439,10 @@ impl App {
             dir_version,
             matches: Vec::new(),
             matches_by_time: Vec::new(),
-            match_search: MatchSearchState::new(search_scope),
+            search_tx,
+            search_rx,
+            next_search_id: 0,
+            latest_search_id: 0,
             selected: 0,
             active_column: 0,
             recent_loading,
@@ -709,6 +736,29 @@ impl App {
     }
 
     fn update_matches(&mut self) {
+        while let Ok(result) = self.search_rx.try_recv() {
+            if result.id != self.latest_search_id
+                || result.query != self.query
+                || result.scope != self.active_scope()
+                || result.file_version
+                    != self
+                        .version_for_scope(result.scope)
+                        .load(AtomicOrdering::Relaxed)
+            {
+                continue;
+            }
+
+            self.matches = result.matches;
+            self.matches_by_time = result.matches_by_time;
+            self.last_query = result.query;
+            self.last_file_count = result.file_count;
+            self.last_file_version = result.file_version;
+            self.last_scope = result.scope;
+            if self.selected >= self.matches.len() {
+                self.selected = self.matches.len().saturating_sub(1);
+            }
+        }
+
         let scope = self.active_scope();
         let files_len = self.files_for_scope(scope).lock().unwrap().len();
         let file_version = self.version_for_scope(scope).load(AtomicOrdering::Relaxed);
@@ -721,41 +771,23 @@ impl App {
             return;
         }
 
-        let (matches, matches_by_time) = {
-            let files_arc = Arc::clone(self.files_for_scope(scope));
-            let files = files_arc.lock().unwrap();
-            self.match_search
-                .reset_if_stale(scope, file_version, files_len);
-            let matches = fuzzy_match_incremental(
-                &self.query,
-                &files,
-                MATCH_LIMIT,
-                MATCH_CANDIDATE_LIMIT,
-                &mut self.match_search,
-            );
+        self.next_search_id += 1;
+        self.latest_search_id = self.next_search_id;
+        let files = self.files_for_scope(scope).lock().unwrap().clone();
+        let _ = self.search_tx.send(SearchRequest {
+            id: self.latest_search_id,
+            query: self.query.clone(),
+            scope,
+            file_version,
+            files,
+        });
 
-            // Recent column: same matches, sorted by combined recency then score.
-            let mut matches_by_time = matches.clone();
-            matches_by_time.sort_by(|a, b| {
-                files[b.index]
-                    .recency_time
-                    .cmp(&files[a.index].recency_time)
-                    .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
-            });
-
-            (matches, matches_by_time)
-        };
-
-        self.matches = matches;
-        self.matches_by_time = matches_by_time;
-
+        // Mark this query/version as requested so the render loop does not enqueue
+        // the same search every tick while the worker is still computing it.
         self.last_query = self.query.clone();
         self.last_file_count = files_len;
         self.last_file_version = file_version;
         self.last_scope = scope;
-        if self.selected >= self.matches.len() {
-            self.selected = self.matches.len().saturating_sub(1);
-        }
     }
 
     fn selected_file(&self) -> Option<String> {
@@ -2019,6 +2051,60 @@ struct TypoWordMatch {
 
 fn fuzzy_match(query: &str, files: &[FileEntry], limit: usize) -> Vec<MatchEntry> {
     fuzzy_match_with_candidates(query, files, limit, limit).0
+}
+
+fn spawn_search_worker(
+    initial_scope: SearchScope,
+) -> (mpsc::Sender<SearchRequest>, mpsc::Receiver<SearchResult>) {
+    let (request_tx, request_rx) = mpsc::channel::<SearchRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<SearchResult>();
+
+    thread::spawn(move || {
+        let mut state = MatchSearchState::new(initial_scope);
+
+        while let Ok(mut request) = request_rx.recv() {
+            // Coalesce bursts of typing: only spend CPU on the newest queued query.
+            while let Ok(newer) = request_rx.try_recv() {
+                request = newer;
+            }
+
+            let file_count = request.files.len();
+            state.reset_if_stale(request.scope, request.file_version, file_count);
+            let matches = fuzzy_match_incremental(
+                &request.query,
+                &request.files,
+                MATCH_LIMIT,
+                MATCH_CANDIDATE_LIMIT,
+                &mut state,
+            );
+
+            // Recent column: same matches, sorted by combined recency then score.
+            let mut matches_by_time = matches.clone();
+            matches_by_time.sort_by(|a, b| {
+                request.files[b.index]
+                    .recency_time
+                    .cmp(&request.files[a.index].recency_time)
+                    .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
+            });
+
+            if result_tx
+                .send(SearchResult {
+                    id: request.id,
+                    query: request.query,
+                    scope: request.scope,
+                    file_version: request.file_version,
+                    file_count,
+                    matches,
+                    matches_by_time,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    (request_tx, result_rx)
 }
 
 fn fuzzy_match_incremental(
