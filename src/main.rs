@@ -44,6 +44,7 @@ const MATCH_QUERY_CACHE_SIZE: usize = 32;
 const INCREMENTAL_QUERY_MIN_CHARS: usize = 3;
 const INCREMENTAL_ACCEPT_MIN_MATCHES: usize = 8;
 const FILE_BATCH_SIZE: usize = 256;
+const ENTRY_SNAPSHOT_PUBLISH_INTERVAL: usize = 20_000;
 const FILE_LOOKBACK_WINDOW: &str = "9d";
 const FILE_LOOKBACK_WINDOW_SECS: u64 = 9 * 24 * 60 * 60;
 const RECENT_POOL_LIMIT: usize = 20_000;
@@ -108,6 +109,8 @@ impl<T> LruCache<T> {
 type ImageCache = LruCache<CachedImage>;
 type VideoCache = LruCache<Vec<CachedImage>>;
 type PendingVideoCache = Arc<Mutex<Option<(String, Vec<CachedImage>)>>>;
+type EntrySnapshot = Arc<Vec<FileEntry>>;
+type SharedEntries = Arc<Mutex<EntrySnapshot>>;
 
 #[derive(Clone)]
 struct FileEntry {
@@ -257,7 +260,7 @@ struct SearchRequest {
     query: String,
     scope: SearchScope,
     file_version: u64,
-    files: Vec<FileEntry>,
+    files: EntrySnapshot,
 }
 
 struct SearchResult {
@@ -315,6 +318,22 @@ enum PreviewContent {
     None,
 }
 
+struct PreviewRequest {
+    id: u64,
+    path: String,
+}
+
+struct PreviewResult {
+    id: u64,
+    path: String,
+    content: PreviewResultContent,
+}
+
+enum PreviewResultContent {
+    Text(Vec<Line<'static>>),
+    Image(Option<CachedImage>),
+}
+
 enum ExitAction {
     Open(String),
     Drag(String),
@@ -345,9 +364,9 @@ impl SearchScope {
 
 struct App {
     query: String,
-    recent_files: Arc<Mutex<Vec<FileEntry>>>,
-    all_files: Arc<Mutex<Vec<FileEntry>>>,
-    dir_entries: Arc<Mutex<Vec<FileEntry>>>,
+    recent_files: SharedEntries,
+    all_files: SharedEntries,
+    dir_entries: SharedEntries,
     recent_version: Arc<AtomicU64>,
     all_version: Arc<AtomicU64>,
     dir_version: Arc<AtomicU64>,
@@ -369,6 +388,10 @@ struct App {
     last_scope: SearchScope,
     preview_path: String,
     preview_content: PreviewContent,
+    preview_tx: mpsc::Sender<PreviewRequest>,
+    preview_rx: mpsc::Receiver<PreviewResult>,
+    next_preview_id: u64,
+    latest_preview_id: u64,
     image_cache: ImageCache,
     video_cache: VideoCache,
     video_frame: usize,
@@ -379,17 +402,15 @@ struct App {
     video_loader_seen_frames: usize,
     video_cache_pending: PendingVideoCache,
     recency_index: Arc<RecencyIndex>,
-    syntax_set: SyntaxSet,
-    theme: syntect::highlighting::Theme,
     drag_mode: bool,
     dir_mode: bool,
 }
 
 impl App {
     fn new(dir_mode: bool) -> Self {
-        let recent_files = Arc::new(Mutex::new(Vec::new()));
-        let all_files = Arc::new(Mutex::new(Vec::new()));
-        let dir_entries = Arc::new(Mutex::new(Vec::new()));
+        let recent_files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
+        let all_files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
+        let dir_entries: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
         let recent_version = Arc::new(AtomicU64::new(0));
         let all_version = Arc::new(AtomicU64::new(0));
         let dir_version = Arc::new(AtomicU64::new(0));
@@ -424,10 +445,7 @@ impl App {
         }
 
         let (search_tx, search_rx) = spawn_search_worker(search_scope);
-
-        let syntax_set = SyntaxSet::load_defaults_newlines();
-        let mut ts = ThemeSet::load_defaults();
-        let theme = ts.themes.remove("base16-ocean.dark").unwrap();
+        let (preview_tx, preview_rx) = spawn_preview_worker();
 
         Self {
             query: String::new(),
@@ -455,6 +473,10 @@ impl App {
             last_scope: search_scope,
             preview_path: String::new(),
             preview_content: PreviewContent::None,
+            preview_tx,
+            preview_rx,
+            next_preview_id: 0,
+            latest_preview_id: 0,
             image_cache: LruCache::new(IMAGE_CACHE_SIZE),
             video_cache: LruCache::new(VIDEO_CACHE_SIZE),
             video_frame: 0,
@@ -465,14 +487,12 @@ impl App {
             video_loader_seen_frames: 0,
             video_cache_pending: Arc::new(Mutex::new(None)),
             recency_index,
-            syntax_set,
-            theme,
             drag_mode: false,
             dir_mode,
         }
     }
 
-    fn files_for_scope(&self, scope: SearchScope) -> &Arc<Mutex<Vec<FileEntry>>> {
+    fn files_for_scope(&self, scope: SearchScope) -> &SharedEntries {
         if self.dir_mode {
             return &self.dir_entries;
         }
@@ -503,6 +523,10 @@ impl App {
             SearchScope::Recent => &self.recent_version,
             SearchScope::All => &self.all_version,
         }
+    }
+
+    fn snapshot_for_scope(&self, scope: SearchScope) -> EntrySnapshot {
+        Arc::clone(&self.files_for_scope(scope).lock().unwrap())
     }
 
     fn active_scope(&self) -> SearchScope {
@@ -581,11 +605,56 @@ impl App {
         }
     }
 
+    fn loading_preview(message: &'static str) -> PreviewContent {
+        PreviewContent::Text(vec![Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::Yellow),
+        ))])
+    }
+
+    fn bump_preview_generation(&mut self) -> u64 {
+        self.next_preview_id += 1;
+        self.latest_preview_id = self.next_preview_id;
+        self.latest_preview_id
+    }
+
+    fn request_preview(&mut self, path: String, loading_message: &'static str) {
+        let id = self.latest_preview_id;
+        self.preview_content = Self::loading_preview(loading_message);
+        let _ = self.preview_tx.send(PreviewRequest { id, path });
+    }
+
+    fn drain_preview_results(&mut self) {
+        while let Ok(result) = self.preview_rx.try_recv() {
+            if result.id != self.latest_preview_id || result.path != self.preview_path {
+                continue;
+            }
+
+            match result.content {
+                PreviewResultContent::Image(Some(img)) => {
+                    self.image_cache.insert(result.path, img.clone());
+                    self.preview_content = PreviewContent::Image(img);
+                }
+                PreviewResultContent::Image(None) => {
+                    self.preview_content = PreviewContent::Text(vec![Line::from(Span::styled(
+                        "[Cannot load image]",
+                        Style::default().fg(Color::DarkGray),
+                    ))]);
+                }
+                PreviewResultContent::Text(lines) => {
+                    self.preview_content = PreviewContent::Text(lines);
+                }
+            }
+        }
+    }
+
     fn update_preview(&mut self) {
         // Drain any pending PNG-compressed frames into the cache
         if let Some((path, frames)) = self.video_cache_pending.lock().unwrap().take() {
             self.video_cache.insert(path, frames);
         }
+
+        self.drain_preview_results();
 
         let current_path = self.selected_file().unwrap_or_default();
         if current_path == self.preview_path {
@@ -658,6 +727,7 @@ impl App {
             return;
         }
         self.preview_path = current_path.clone();
+        self.bump_preview_generation();
 
         // Cancel any in-flight video loader for a different path
         if self.video_loader_path != current_path {
@@ -702,36 +772,9 @@ impl App {
                 self.preview_content = PreviewContent::Image(cached.clone());
                 return;
             }
-            if let Some(img) = load_thumbnail(&current_path) {
-                self.image_cache.insert(current_path.clone(), img.clone());
-                self.preview_content = PreviewContent::Image(img);
-            } else {
-                self.preview_content = PreviewContent::Text(vec![Line::from(Span::styled(
-                    "[Cannot load image]",
-                    Style::default().fg(Color::DarkGray),
-                ))]);
-            }
+            self.request_preview(current_path, "Loading image...");
         } else {
-            let lines = read_preview(&current_path, 40);
-            let is_dir = fs::metadata(&current_path)
-                .map(|metadata| metadata.is_dir())
-                .unwrap_or(false);
-            // Error/info messages (single line starting with '[') stay plain
-            if lines.len() == 1 && lines[0].starts_with('[') {
-                self.preview_content = PreviewContent::Text(vec![Line::from(Span::styled(
-                    lines[0].clone(),
-                    Style::default().fg(Color::DarkGray),
-                ))]);
-            } else if is_dir {
-                self.preview_content = PreviewContent::Text(plain_preview(lines));
-            } else {
-                self.preview_content = PreviewContent::Text(highlight_preview(
-                    &lines,
-                    &current_path,
-                    &self.syntax_set,
-                    &self.theme,
-                ));
-            }
+            self.request_preview(current_path, "Loading preview...");
         }
     }
 
@@ -760,7 +803,8 @@ impl App {
         }
 
         let scope = self.active_scope();
-        let files_len = self.files_for_scope(scope).lock().unwrap().len();
+        let files = self.snapshot_for_scope(scope);
+        let files_len = files.len();
         let file_version = self.version_for_scope(scope).load(AtomicOrdering::Relaxed);
         let query_changed = self.query != self.last_query;
         let files_changed =
@@ -773,7 +817,6 @@ impl App {
 
         self.next_search_id += 1;
         self.latest_search_id = self.next_search_id;
-        let files = self.files_for_scope(scope).lock().unwrap().clone();
         let _ = self.search_tx.send(SearchRequest {
             id: self.latest_search_id,
             query: self.query.clone(),
@@ -791,7 +834,7 @@ impl App {
     }
 
     fn selected_file(&self) -> Option<String> {
-        let files = self.files_for_scope(self.active_scope()).lock().unwrap();
+        let files = self.snapshot_for_scope(self.active_scope());
         let matches = if self.active_column == 0 {
             &self.matches
         } else {
@@ -1170,7 +1213,7 @@ fn build_fd_args(dir_mode: bool, recent_only: bool) -> Vec<String> {
 }
 
 fn spawn_entry_loader(
-    files: Arc<Mutex<Vec<FileEntry>>>,
+    files: SharedEntries,
     loading: Arc<Mutex<bool>>,
     version: Arc<AtomicU64>,
     dir_mode: bool,
@@ -1178,8 +1221,7 @@ fn spawn_entry_loader(
     recency_index: Arc<RecencyIndex>,
 ) {
     *loading.lock().unwrap() = true;
-    files.lock().unwrap().clear();
-    mark_entries_changed(&version);
+    publish_entries(&files, &[], &version);
 
     thread::spawn(move || {
         load_entries(
@@ -1194,7 +1236,7 @@ fn spawn_entry_loader(
 }
 
 fn load_entries(
-    files: Arc<Mutex<Vec<FileEntry>>>,
+    files: SharedEntries,
     loading: Arc<Mutex<bool>>,
     version: Arc<AtomicU64>,
     dir_mode: bool,
@@ -1202,15 +1244,16 @@ fn load_entries(
     recency_index: Arc<RecencyIndex>,
 ) {
     let mut seen = HashSet::new();
+    let mut loaded = Vec::new();
 
     if recent_only && !dir_mode {
         // Stage 1: paths we already know were recently opened by ffp or the desktop.
         let mut buffer = Vec::new();
         for path in recency_index.candidate_paths() {
-            push_entry_if_wanted(path, &files, &mut buffer, &mut seen, &recency_index, true);
+            push_entry_if_wanted(path, &mut buffer, &mut seen, &recency_index, true);
         }
-        flush_entry_buffer(&files, &mut buffer, &version, true);
-        sort_loaded_entries(&files, &version, true);
+        flush_entry_buffer(&files, &mut loaded, &mut buffer, &version, true);
+        sort_loaded_entries(&files, &mut loaded, &version, true);
 
         // Stage 2: the old fast path, modified recently according to fd.
         load_fd_entries(
@@ -1219,9 +1262,10 @@ fn load_entries(
             &version,
             &recency_index,
             &mut seen,
+            &mut loaded,
             true,
         );
-        sort_loaded_entries(&files, &version, true);
+        sort_loaded_entries(&files, &mut loaded, &version, true);
 
         // Stage 3: broader background pass for access-time recency. This can take
         // longer on large homes, but the UI is already usable from stages 1 and 2.
@@ -1231,6 +1275,7 @@ fn load_entries(
             &version,
             &recency_index,
             &mut seen,
+            &mut loaded,
             true,
         );
     } else {
@@ -1240,21 +1285,23 @@ fn load_entries(
             &version,
             &recency_index,
             &mut seen,
+            &mut loaded,
             false,
         );
     }
 
-    sort_loaded_entries(&files, &version, recent_only && !dir_mode);
+    sort_loaded_entries(&files, &mut loaded, &version, recent_only && !dir_mode);
 
     *loading.lock().unwrap() = false;
 }
 
 fn load_fd_entries(
     args: Vec<String>,
-    files: &Arc<Mutex<Vec<FileEntry>>>,
+    files: &SharedEntries,
     version: &AtomicU64,
     recency_index: &RecencyIndex,
     seen: &mut HashSet<String>,
+    loaded: &mut Vec<FileEntry>,
     recent_only: bool,
 ) {
     let child = Command::new("fd")
@@ -1278,14 +1325,14 @@ fn load_fd_entries(
                 }
 
                 let path = String::from_utf8_lossy(&line).to_string();
-                push_entry_if_wanted(path, files, &mut buffer, seen, recency_index, recent_only);
+                push_entry_if_wanted(path, &mut buffer, seen, recency_index, recent_only);
 
                 if buffer.len() >= FILE_BATCH_SIZE {
-                    flush_entry_buffer(files, &mut buffer, version, recent_only);
+                    flush_entry_buffer(files, loaded, &mut buffer, version, recent_only);
                 }
             }
 
-            flush_entry_buffer(files, &mut buffer, version, recent_only);
+            flush_entry_buffer(files, loaded, &mut buffer, version, recent_only);
         }
         let _ = child.wait();
     }
@@ -1293,7 +1340,6 @@ fn load_fd_entries(
 
 fn push_entry_if_wanted(
     path: String,
-    _files: &Arc<Mutex<Vec<FileEntry>>>,
     buffer: &mut Vec<FileEntry>,
     seen: &mut HashSet<String>,
     recency_index: &RecencyIndex,
@@ -1317,32 +1363,39 @@ fn push_entry_if_wanted(
 }
 
 fn flush_entry_buffer(
-    files: &Arc<Mutex<Vec<FileEntry>>>,
+    files: &SharedEntries,
+    loaded: &mut Vec<FileEntry>,
     buffer: &mut Vec<FileEntry>,
     version: &AtomicU64,
     cap_recent_pool: bool,
 ) {
     if !buffer.is_empty() {
-        let mut files = files.lock().unwrap();
-        files.extend(buffer.drain(..));
-        if cap_recent_pool && files.len() > RECENT_POOL_LIMIT * 2 {
-            files.sort_by(compare_entries_by_recency);
-            files.truncate(RECENT_POOL_LIMIT);
+        loaded.extend(buffer.drain(..));
+        if cap_recent_pool && loaded.len() >= RECENT_POOL_LIMIT * 2 {
+            loaded.sort_by(compare_entries_by_recency);
+            loaded.truncate(RECENT_POOL_LIMIT);
+            publish_entries(files, loaded, version);
+        } else if loaded.len() % ENTRY_SNAPSHOT_PUBLISH_INTERVAL < FILE_BATCH_SIZE {
+            publish_entries(files, loaded, version);
         }
-        mark_entries_changed(version);
     }
 }
 
 fn sort_loaded_entries(
-    files: &Arc<Mutex<Vec<FileEntry>>>,
+    files: &SharedEntries,
+    loaded: &mut Vec<FileEntry>,
     version: &AtomicU64,
     cap_recent_pool: bool,
 ) {
-    let mut files = files.lock().unwrap();
-    files.sort_by(compare_entries_by_recency);
+    loaded.sort_by(compare_entries_by_recency);
     if cap_recent_pool {
-        files.truncate(RECENT_POOL_LIMIT);
+        loaded.truncate(RECENT_POOL_LIMIT);
     }
+    publish_entries(files, loaded, version);
+}
+
+fn publish_entries(files: &SharedEntries, loaded: &[FileEntry], version: &AtomicU64) {
+    *files.lock().unwrap() = Arc::new(loaded.to_vec());
     mark_entries_changed(version);
 }
 
@@ -1357,7 +1410,7 @@ fn compare_entries_by_recency(a: &FileEntry, b: &FileEntry) -> Ordering {
         .then_with(|| a.name_lower.cmp(&b.name_lower))
 }
 
-fn load_files(files: Arc<Mutex<Vec<FileEntry>>>, loading: Arc<Mutex<bool>>) {
+fn load_files(files: SharedEntries, loading: Arc<Mutex<bool>>) {
     load_entries(
         files,
         loading,
@@ -2105,6 +2158,70 @@ fn spawn_search_worker(
     });
 
     (request_tx, result_rx)
+}
+
+fn spawn_preview_worker() -> (mpsc::Sender<PreviewRequest>, mpsc::Receiver<PreviewResult>) {
+    let (request_tx, request_rx) = mpsc::channel::<PreviewRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<PreviewResult>();
+
+    thread::spawn(move || {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let mut theme_set = ThemeSet::load_defaults();
+        let theme = theme_set
+            .themes
+            .remove("base16-ocean.dark")
+            .unwrap_or_else(|| theme_set.themes.into_values().next().unwrap_or_default());
+
+        while let Ok(mut request) = request_rx.recv() {
+            // Coalesce fast selection changes so a slow image decode cannot build a
+            // long preview backlog behind the cursor/input loop.
+            while let Ok(newer) = request_rx.try_recv() {
+                request = newer;
+            }
+
+            let content = load_preview_result_content(&request.path, &syntax_set, &theme);
+            if result_tx
+                .send(PreviewResult {
+                    id: request.id,
+                    path: request.path,
+                    content,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    (request_tx, result_rx)
+}
+
+fn load_preview_result_content(
+    path: &str,
+    syntax_set: &SyntaxSet,
+    theme: &syntect::highlighting::Theme,
+) -> PreviewResultContent {
+    if is_image_file(path) {
+        return PreviewResultContent::Image(load_thumbnail(path));
+    }
+
+    let lines = read_preview(path, 40);
+    let is_dir = fs::metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+
+    let rendered = if lines.len() == 1 && lines[0].starts_with('[') {
+        vec![Line::from(Span::styled(
+            lines[0].clone(),
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else if is_dir {
+        plain_preview(lines)
+    } else {
+        highlight_preview(&lines, path, syntax_set, theme)
+    };
+
+    PreviewResultContent::Text(rendered)
 }
 
 fn fuzzy_match_incremental(
@@ -2861,14 +2978,14 @@ fn get_rss_kb() -> usize {
 }
 
 fn run_profile() -> io::Result<()> {
-    let files = Arc::new(Mutex::new(Vec::new()));
+    let files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
     let loading = Arc::new(Mutex::new(true));
 
     let start = Instant::now();
     load_files(Arc::clone(&files), Arc::clone(&loading));
     let load_duration = start.elapsed();
 
-    let files = files.lock().unwrap();
+    let files = Arc::clone(&files.lock().unwrap());
     let file_count = files.len();
     eprintln!(
         "profile: loaded {} files in {:?}",
@@ -2876,7 +2993,7 @@ fn run_profile() -> io::Result<()> {
     );
 
     let empty_start = Instant::now();
-    let empty_matches = fuzzy_match("", &files, MATCH_LIMIT);
+    let empty_matches = fuzzy_match("", files.as_ref(), MATCH_LIMIT);
     eprintln!(
         "profile: query <empty> -> {} matches in {:?}",
         empty_matches.len(),
@@ -2886,7 +3003,7 @@ fn run_profile() -> io::Result<()> {
     let queries = env::var("FFP_PROFILE_QUERIES").unwrap_or_else(|_| "rs,main,doc".to_string());
     for query in queries.split(',').map(str::trim).filter(|q| !q.is_empty()) {
         let start = Instant::now();
-        let matches = fuzzy_match(query, &files, MATCH_LIMIT);
+        let matches = fuzzy_match(query, files.as_ref(), MATCH_LIMIT);
         eprintln!(
             "profile: query {:?} -> {} matches in {:?}",
             query,
@@ -2908,7 +3025,7 @@ fn run_profile() -> io::Result<()> {
         let start = Instant::now();
         let matches = fuzzy_match_incremental(
             query,
-            &files,
+            files.as_ref(),
             MATCH_LIMIT,
             MATCH_CANDIDATE_LIMIT,
             &mut match_state,
@@ -4191,10 +4308,10 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
 
     // Build file list items (all matches, scrolling handled by ListState)
     let (score_items, time_items, file_count) = {
-        let files = app.files_for_scope(active_scope).lock().unwrap();
+        let files = app.snapshot_for_scope(active_scope);
         let count = files.len();
-        let score_list = build_file_items(&app.matches, &files);
-        let time_list = build_file_items(&app.matches_by_time, &files);
+        let score_list = build_file_items(&app.matches, files.as_ref());
+        let time_list = build_file_items(&app.matches_by_time, files.as_ref());
         (score_list, time_list, count)
     };
 
