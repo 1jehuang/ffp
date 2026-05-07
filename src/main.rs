@@ -58,7 +58,7 @@ const HISTORY_MAX_ENTRIES: usize = 5000;
 
 #[derive(Clone, Debug)]
 struct CachedImage {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     width: u32,
     height: u32,
     is_raw_rgb: bool,
@@ -686,7 +686,7 @@ impl App {
                                         let img = image::RgbImage::from_raw(
                                             f.width,
                                             f.height,
-                                            f.data.clone(),
+                                            f.data.as_ref().clone(),
                                         )?;
                                         let mut buf = Vec::new();
                                         let mut cursor = std::io::Cursor::new(&mut buf);
@@ -694,7 +694,7 @@ impl App {
                                             .write_to(&mut cursor, image::ImageFormat::Png)
                                             .ok()?;
                                         Some(CachedImage {
-                                            data: buf,
+                                            data: Arc::new(buf),
                                             width: f.width,
                                             height: f.height,
                                             is_raw_rgb: false,
@@ -1751,7 +1751,7 @@ fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
             while buf.len() >= frame_size {
                 let raw_frame: Vec<u8> = buf.drain(..frame_size).collect();
                 shared.lock().unwrap().push(CachedImage {
-                    data: raw_frame,
+                    data: Arc::new(raw_frame),
                     width: out_w,
                     height: out_h,
                     is_raw_rgb: true,
@@ -1856,7 +1856,7 @@ fn load_thumbnail(path: &str) -> Option<CachedImage> {
         .ok()?;
 
     Some(CachedImage {
-        data: png_data,
+        data: Arc::new(png_data),
         width: new_w,
         height: new_h,
         is_raw_rgb: false,
@@ -1928,7 +1928,7 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
         area.x as u32 + 1 + offset_x
     )?;
 
-    let b64_data = BASE64.encode(&img.data);
+    let b64_data = BASE64.encode(img.data.as_slice());
 
     let chunk_size = 4096;
     let chunks: Vec<&str> = b64_data
@@ -3514,7 +3514,7 @@ mod tests {
     #[test]
     fn kitty_png_image_has_correct_format() {
         let img = CachedImage {
-            data: vec![0u8; 100],
+            data: Arc::new(vec![0u8; 100]),
             width: 200,
             height: 100,
             is_raw_rgb: false,
@@ -3551,7 +3551,7 @@ mod tests {
         let w = 160u32;
         let h = 90u32;
         let img = CachedImage {
-            data: vec![0u8; (w * h * 3) as usize],
+            data: Arc::new(vec![0u8; (w * h * 3) as usize]),
             width: w,
             height: h,
             is_raw_rgb: true,
@@ -3586,7 +3586,7 @@ mod tests {
     #[test]
     fn kitty_multi_chunk_has_correct_continuation() {
         let img = CachedImage {
-            data: vec![0xFFu8; 8192],
+            data: Arc::new(vec![0xFFu8; 8192]),
             width: 50,
             height: 50,
             is_raw_rgb: false,
@@ -3633,7 +3633,7 @@ mod tests {
     #[test]
     fn kitty_render_to_does_not_toggle_cursor() {
         let img = CachedImage {
-            data: vec![0u8; 10],
+            data: Arc::new(vec![0u8; 10]),
             width: 10,
             height: 10,
             is_raw_rgb: false,
@@ -3666,7 +3666,7 @@ mod tests {
     #[test]
     fn kitty_render_no_cursor_toggle() {
         let img = CachedImage {
-            data: vec![0u8; 100],
+            data: Arc::new(vec![0u8; 100]),
             width: 50,
             height: 50,
             is_raw_rgb: false,
@@ -3711,7 +3711,7 @@ mod tests {
     #[test]
     fn kitty_no_response_triggers() {
         let img = CachedImage {
-            data: vec![0u8; 100],
+            data: Arc::new(vec![0u8; 100]),
             width: 50,
             height: 50,
             is_raw_rgb: false,
@@ -3742,7 +3742,7 @@ mod tests {
     #[test]
     fn kitty_aspect_ratio_preserved() {
         let img = CachedImage {
-            data: vec![0u8; 10],
+            data: Arc::new(vec![0u8; 10]),
             width: 1920,
             height: 1080,
             is_raw_rgb: false,
@@ -3966,7 +3966,7 @@ mod tests {
     #[test]
     fn cursor_never_shown_at_wrong_position() {
         let img = CachedImage {
-            data: vec![0u8; 100],
+            data: Arc::new(vec![0u8; 100]),
             width: 200,
             height: 100,
             is_raw_rgb: false,
@@ -3996,7 +3996,7 @@ mod tests {
     fn video_rapid_frames_no_cursor_leak() {
         let frames: Vec<CachedImage> = (0..5)
             .map(|i| CachedImage {
-                data: vec![i as u8; 50],
+                data: Arc::new(vec![i as u8; 50]),
                 width: 10,
                 height: 10,
                 is_raw_rgb: false,
@@ -4038,7 +4038,7 @@ mod tests {
 
         let frames: Vec<CachedImage> = (0..10)
             .map(|i| CachedImage {
-                data: vec![i; 100],
+                data: Arc::new(vec![i; 100]),
                 width: 40,
                 height: 30,
                 is_raw_rgb: false,
@@ -4097,7 +4097,7 @@ mod tests {
     fn end_to_end_render_loop_no_flicker() {
         let frames: Vec<CachedImage> = (0..10)
             .map(|i| CachedImage {
-                data: vec![i as u8; 200],
+                data: Arc::new(vec![i as u8; 200]),
                 width: 40,
                 height: 30,
                 is_raw_rgb: false,
@@ -4853,7 +4853,7 @@ fn run_bench_flicker() -> io::Result<()> {
                 *b = ((i * 7 + j) & 0xFF) as u8;
             }
             CachedImage {
-                data,
+                data: Arc::new(data),
                 width: frame_w,
                 height: frame_h,
                 is_raw_rgb: true,
