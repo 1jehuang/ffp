@@ -5140,43 +5140,48 @@ fn main() -> io::Result<()> {
             cursor_pos = result.1;
         })?;
 
-        if let Some(area) = image_area {
-            let inner = Rect {
-                x: area.x + 1,
-                y: area.y + 1,
-                width: area.width.saturating_sub(2),
-                height: area.height.saturating_sub(2),
-            };
-            match &app.preview_content {
-                PreviewContent::Image(ref img) => {
-                    if app.preview_path != last_rendered_path {
-                        let _ = render_kitty_image(img, inner, cursor_pos);
-                        last_rendered_path = app.preview_path.clone();
-                    }
-                    last_image_area = Some(area);
-                }
-                PreviewContent::Video(ref frames) | PreviewContent::VideoStreaming(ref frames) => {
-                    if let Some(idx) = video_render_decision(
-                        app.video_frame_time.elapsed(),
-                        &mut app.video_frame,
-                        &mut app.video_frame_time,
-                        frames.len(),
-                        &app.preview_path,
-                        &last_rendered_path,
-                    ) {
-                        if let Some(frame) = frames.get(idx) {
-                            let _ = render_kitty_image(frame, inner, cursor_pos);
+        let input_pending = event::poll(Duration::from_millis(0))?;
+
+        if !input_pending {
+            if let Some(area) = image_area {
+                let inner = Rect {
+                    x: area.x + 1,
+                    y: area.y + 1,
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                };
+                match &app.preview_content {
+                    PreviewContent::Image(ref img) => {
+                        if app.preview_path != last_rendered_path {
+                            let _ = render_kitty_image(img, inner, cursor_pos);
+                            last_rendered_path = app.preview_path.clone();
                         }
-                        last_rendered_path = app.preview_path.clone();
+                        last_image_area = Some(area);
                     }
-                    last_image_area = Some(area);
+                    PreviewContent::Video(ref frames)
+                    | PreviewContent::VideoStreaming(ref frames) => {
+                        if let Some(idx) = video_render_decision(
+                            app.video_frame_time.elapsed(),
+                            &mut app.video_frame,
+                            &mut app.video_frame_time,
+                            frames.len(),
+                            &app.preview_path,
+                            &last_rendered_path,
+                        ) {
+                            if let Some(frame) = frames.get(idx) {
+                                let _ = render_kitty_image(frame, inner, cursor_pos);
+                            }
+                            last_rendered_path = app.preview_path.clone();
+                        }
+                        last_image_area = Some(area);
+                    }
+                    _ => {}
                 }
-                _ => {}
+            } else if last_image_area.is_some() {
+                let _ = clear_kitty_image();
+                last_image_area = None;
+                last_rendered_path.clear();
             }
-        } else if last_image_area.is_some() {
-            let _ = clear_kitty_image();
-            last_image_area = None;
-            last_rendered_path.clear();
         }
 
         // Poll with shorter timeout for smooth video, longer for static content
