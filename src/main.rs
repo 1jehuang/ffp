@@ -2,7 +2,7 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,7 +20,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     env, fs,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     os::unix::{
         fs::{FileTypeExt, OpenOptionsExt},
         io::AsRawFd,
@@ -51,8 +51,12 @@ const RECENT_POOL_LIMIT: usize = 20_000;
 const IMAGE_CACHE_SIZE: usize = 10;
 const THUMBNAIL_MAX_WIDTH: u32 = 800;
 const THUMBNAIL_MAX_HEIGHT: u32 = 600;
+const VIDEO_THUMBNAIL_MAX_WIDTH: u32 = 360;
+const VIDEO_THUMBNAIL_MAX_HEIGHT: u32 = 240;
 const VIDEO_PREVIEW_FRAMES: usize = 75;
-const VIDEO_FRAME_INTERVAL_MS: u64 = 66;
+const VIDEO_FRAME_INTERVAL_MS: u64 = 100;
+const INPUT_RENDER_GRACE_MS: u64 = 90;
+const INPUT_DRAIN_LIMIT: usize = 32;
 const VIDEO_CACHE_SIZE: usize = 5;
 const HISTORY_MAX_ENTRIES: usize = 5000;
 
@@ -111,6 +115,88 @@ type VideoCache = LruCache<Vec<CachedImage>>;
 type PendingVideoCache = Arc<Mutex<Option<(String, Vec<CachedImage>)>>>;
 type EntrySnapshot = Arc<Vec<FileEntry>>;
 type SharedEntries = Arc<Mutex<EntrySnapshot>>;
+
+struct TraceLogger {
+    writer: Option<BufWriter<fs::File>>,
+    slow_threshold: Duration,
+}
+
+impl TraceLogger {
+    fn new(args: &[String]) -> Self {
+        let enabled = args.iter().any(|arg| arg == "--trace-responsive")
+            || env::var("FFP_TRACE_RESPONSIVENESS")
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+                .unwrap_or(false);
+
+        if !enabled {
+            return Self {
+                writer: None,
+                slow_threshold: Duration::from_millis(8),
+            };
+        }
+
+        let path = env::var_os("FFP_TRACE_LOG")
+            .map(PathBuf::from)
+            .or_else(|| history_file_path().map(|path| path.with_file_name("responsiveness.log")));
+        let writer = path.and_then(|path| {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+                .map(BufWriter::new)
+        });
+
+        let slow_threshold = env::var("FFP_TRACE_SLOW_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(8));
+
+        let mut logger = Self {
+            writer,
+            slow_threshold,
+        };
+        logger.log("trace_start", format!("pid={}", std::process::id()));
+        logger
+    }
+
+    fn enabled(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    fn log(&mut self, event: &str, detail: impl AsRef<str>) {
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        let _ = writeln!(
+            writer,
+            "{} event={} {}",
+            unix_time_ms(),
+            event,
+            detail.as_ref()
+        );
+    }
+
+    fn log_duration(&mut self, event: &str, duration: Duration, detail: impl AsRef<str>) {
+        if duration >= self.slow_threshold {
+            self.log(
+                event,
+                format!("duration_us={} {}", duration.as_micros(), detail.as_ref()),
+            );
+        }
+    }
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
 
 #[derive(Clone)]
 struct FileEntry {
@@ -1697,8 +1783,12 @@ fn compute_scaled_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> 
 fn stream_video_frames(path: &str, shared: Arc<Mutex<Vec<CachedImage>>>) {
     let duration = get_video_duration(path).unwrap_or(5.0);
     let (src_w, src_h) = get_video_dimensions(path).unwrap_or((640, 480));
-    let (out_w, out_h) =
-        compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+    let (out_w, out_h) = compute_scaled_dimensions(
+        src_w,
+        src_h,
+        VIDEO_THUMBNAIL_MAX_WIDTH,
+        VIDEO_THUMBNAIL_MAX_HEIGHT,
+    );
     let frame_size = (out_w * out_h * 3) as usize;
 
     let fps = (VIDEO_PREVIEW_FRAMES as f64 / duration).max(0.5);
@@ -3115,8 +3205,12 @@ fn run_profile() -> io::Result<()> {
                 eprintln!("  duration: {:.1}s", dur);
             }
             if let Some((w, h)) = get_video_dimensions(&file.path) {
-                let (sw, sh) =
-                    compute_scaled_dimensions(w, h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+                let (sw, sh) = compute_scaled_dimensions(
+                    w,
+                    h,
+                    VIDEO_THUMBNAIL_MAX_WIDTH,
+                    VIDEO_THUMBNAIL_MAX_HEIGHT,
+                );
                 eprintln!("  source: {}x{} -> scaled: {}x{}", w, h, sw, sh);
                 let frame_bytes = sw as usize * sh as usize * 3;
                 eprintln!(
@@ -3212,6 +3306,203 @@ fn run_profile() -> io::Result<()> {
             eprintln!("  hot cache access {:?}: {:?}", first.name, start.elapsed());
         }
     }
+
+    Ok(())
+}
+
+fn percentile_duration(samples: &mut [Duration], percentile: f64) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    samples.sort_unstable();
+    let rank = ((samples.len() - 1) as f64 * percentile).round() as usize;
+    samples[rank.min(samples.len() - 1)]
+}
+
+fn synthetic_frame(width: u32, height: u32, is_raw_rgb: bool) -> CachedImage {
+    let bytes_per_pixel = if is_raw_rgb { 3 } else { 1 };
+    let size = (width * height * bytes_per_pixel) as usize;
+    let mut data = vec![0u8; size];
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = (i & 0xff) as u8;
+    }
+    CachedImage {
+        data: Arc::new(data),
+        width,
+        height,
+        is_raw_rgb,
+    }
+}
+
+fn bench_kitty_render(label: &str, frame: &CachedImage, iterations: usize) -> io::Result<()> {
+    let area = Rect {
+        x: 60,
+        y: 2,
+        width: 50,
+        height: 25,
+    };
+    let mut samples = Vec::with_capacity(iterations);
+    let mut bytes = 0usize;
+
+    for _ in 0..iterations {
+        let mut out = Vec::with_capacity(frame.data.len() * 2);
+        let start = Instant::now();
+        render_kitty_image_to(frame, area, &mut out)?;
+        samples.push(start.elapsed());
+        bytes = out.len();
+    }
+
+    let mut sorted = samples.clone();
+    let p50 = percentile_duration(&mut sorted, 0.50);
+    let mut sorted = samples.clone();
+    let p95 = percentile_duration(&mut sorted, 0.95);
+    let max = samples.iter().copied().max().unwrap_or_default();
+    eprintln!(
+        "bench: kitty_render {label}: {}x{} raw={} payload={:.1} KiB p50={:?} p95={:?} max={:?}",
+        frame.width,
+        frame.height,
+        frame.is_raw_rgb,
+        bytes as f64 / 1024.0,
+        p50,
+        p95,
+        max
+    );
+
+    Ok(())
+}
+
+fn run_bench_responsiveness() -> io::Result<()> {
+    eprintln!("=== Responsiveness Benchmark ===");
+
+    let files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
+    let loading = Arc::new(Mutex::new(true));
+    let start = Instant::now();
+    load_files(Arc::clone(&files), Arc::clone(&loading));
+    let files = Arc::clone(&files.lock().unwrap());
+    eprintln!(
+        "bench: loaded {} files for responsiveness benchmark in {:?}",
+        files.len(),
+        start.elapsed()
+    );
+
+    let (search_tx, search_rx) = spawn_search_worker(SearchScope::Recent);
+    let queries = env::var("FFP_BENCH_QUERIES").unwrap_or_else(|_| "m,ma,mai,main,doc,rs".into());
+    eprintln!("\n=== Key -> search worker result ===");
+    let mut id = 0u64;
+    let mut samples = Vec::new();
+    for query in queries.split(',').map(str::trim).filter(|q| !q.is_empty()) {
+        id += 1;
+        let start = Instant::now();
+        let _ = search_tx.send(SearchRequest {
+            id,
+            query: query.to_string(),
+            scope: SearchScope::Recent,
+            file_version: 0,
+            files: Arc::clone(&files),
+        });
+        match search_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => {
+                let elapsed = start.elapsed();
+                samples.push(elapsed);
+                eprintln!(
+                    "bench: key_to_search {:?}: {:?} matches={}",
+                    query,
+                    elapsed,
+                    result.matches.len()
+                );
+            }
+            Err(err) => eprintln!("bench: key_to_search {:?}: TIMEOUT/ERR {err}", query),
+        }
+    }
+    let mut sorted = samples.clone();
+    eprintln!(
+        "bench: key_to_search summary p50={:?} p95={:?} max={:?}",
+        percentile_duration(&mut sorted, 0.50),
+        percentile_duration(&mut samples, 0.95),
+        samples.iter().copied().max().unwrap_or_default()
+    );
+
+    eprintln!("\n=== Preview render payload generation ===");
+    let (video_w, video_h) = compute_scaled_dimensions(
+        2880,
+        1800,
+        VIDEO_THUMBNAIL_MAX_WIDTH,
+        VIDEO_THUMBNAIL_MAX_HEIGHT,
+    );
+    let (old_w, old_h) =
+        compute_scaled_dimensions(2880, 1800, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+    bench_kitty_render(
+        "video_current",
+        &synthetic_frame(video_w, video_h, true),
+        30,
+    )?;
+    bench_kitty_render("video_old_800px", &synthetic_frame(old_w, old_h, true), 15)?;
+    bench_kitty_render("image_png_like", &synthetic_frame(800, 450, false), 30)?;
+
+    eprintln!("\n=== Preview decode/highlight candidates ===");
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let mut theme_set = ThemeSet::load_defaults();
+    let theme = theme_set
+        .themes
+        .remove("base16-ocean.dark")
+        .unwrap_or_else(|| theme_set.themes.into_values().next().unwrap_or_default());
+    if let Some(text_file) = files
+        .iter()
+        .find(|entry| !entry.is_dir && is_text_extension(&entry.path))
+    {
+        let start = Instant::now();
+        let _ = load_preview_result_content(&text_file.path, &syntax_set, &theme);
+        eprintln!(
+            "bench: text_preview {:?}: {:?}",
+            text_file.name,
+            start.elapsed()
+        );
+    }
+    if let Some(image_file) = files.iter().find(|entry| is_image_file(&entry.path)) {
+        let start = Instant::now();
+        let _ = load_preview_result_content(&image_file.path, &syntax_set, &theme);
+        eprintln!(
+            "bench: image_preview {:?}: {:?}",
+            image_file.name,
+            start.elapsed()
+        );
+    }
+
+    eprintln!("\n=== Input grace model ===");
+    let cycles = 120usize;
+    let mut renders_without_grace = 0usize;
+    let mut renders_with_grace = 0usize;
+    let mut skipped_for_input = 0usize;
+    let mut last_input_at = Some(Instant::now());
+    let sim_start = Instant::now();
+    for cycle in 0..cycles {
+        if cycle % 3 == 0 {
+            last_input_at = Some(Instant::now());
+        }
+        let should_render = cycle % 4 == 0;
+        if should_render {
+            renders_without_grace += 1;
+            let input_recent = last_input_at
+                .map(|at| at.elapsed() < Duration::from_millis(INPUT_RENDER_GRACE_MS))
+                .unwrap_or(false);
+            if input_recent {
+                skipped_for_input += 1;
+            } else {
+                renders_with_grace += 1;
+            }
+        }
+        let target = sim_start + Duration::from_millis((cycle as u64 + 1) * 16);
+        while Instant::now() < target {
+            thread::yield_now();
+        }
+    }
+    eprintln!(
+        "bench: input_grace renders_without={} renders_with={} skipped_for_recent_input={} grace_ms={}",
+        renders_without_grace,
+        renders_with_grace,
+        skipped_for_input,
+        INPUT_RENDER_GRACE_MS
+    );
 
     Ok(())
 }
@@ -3921,22 +4212,21 @@ mod tests {
     fn video_no_flicker_simulation() {
         // Simulate 20 render cycles at 16ms intervals for a 10-frame video.
         // Every cycle must either render or have a valid reason to skip.
-        // The first cycle and every ~4th cycle (66ms/16ms) should render.
+        // The first cycle and each configured video interval should render.
         let mut frame = 0usize;
         let mut time = Instant::now();
         let mut last_path = String::new();
         let path = "/videos/test.mp4";
         let mut render_count = 0;
         let mut gap = 0; // cycles since last render
+        let mut elapsed_since_render = Duration::ZERO;
+        let max_gap = (VIDEO_FRAME_INTERVAL_MS as usize).div_ceil(16) + 1;
 
         for cycle in 0..20 {
-            let _elapsed = Duration::from_millis(cycle as u64 * 16);
-            // Simulate time passing
             let fake_elapsed = if cycle == 0 {
                 Duration::from_millis(0)
             } else {
-                // Time since last frame_time reset
-                Duration::from_millis((cycle - (render_count.max(1) - 1) * 4) as u64 * 16)
+                elapsed_since_render + Duration::from_millis(16)
             };
 
             let result =
@@ -3946,12 +4236,12 @@ mod tests {
                 render_count += 1;
                 last_path = path.to_string();
                 gap = 0;
+                elapsed_since_render = Duration::ZERO;
             } else {
                 gap += 1;
-                // If we haven't rendered in 5+ cycles (80ms), that's a flicker bug.
-                // At 66ms interval, max gap should be ~4 cycles.
+                elapsed_since_render = fake_elapsed;
                 assert!(
-                    gap <= 5,
+                    gap <= max_gap,
                     "flicker detected: {} consecutive skipped renders at cycle {} (frame {})",
                     gap,
                     cycle,
@@ -4660,8 +4950,12 @@ fn run_test_video() -> io::Result<()> {
     eprintln!("[{:?}] dimensions: {:?}", start2.elapsed(), dims);
 
     let (src_w, src_h) = dims.unwrap_or((640, 480));
-    let (out_w, out_h) =
-        compute_scaled_dimensions(src_w, src_h, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT);
+    let (out_w, out_h) = compute_scaled_dimensions(
+        src_w,
+        src_h,
+        VIDEO_THUMBNAIL_MAX_WIDTH,
+        VIDEO_THUMBNAIL_MAX_HEIGHT,
+    );
     let frame_size = (out_w * out_h * 3) as usize;
     eprintln!(
         "  scaled: {}x{}, raw frame: {} bytes\n",
@@ -5096,6 +5390,123 @@ fn drag_file(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn handle_key_press(
+    key: KeyEvent,
+    app: &mut App,
+    selection_path: &Option<String>,
+    chosen: &mut Option<ExitAction>,
+) -> bool {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => true,
+        (KeyCode::Enter, _) => {
+            if let Some(file) = app.selected_file() {
+                if selection_path.is_some() {
+                    *chosen = Some(ExitAction::Choose(file));
+                } else if app.drag_mode {
+                    *chosen = Some(ExitAction::Drag(file));
+                } else {
+                    *chosen = Some(ExitAction::Open(file));
+                }
+            }
+            true
+        }
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            if let Some(file) = app.selected_file() {
+                *chosen = Some(ExitAction::Drag(file));
+            }
+            true
+        }
+        (KeyCode::Down, _) | (KeyCode::Tab, KeyModifiers::NONE) => {
+            if app.selected < app.active_matches().len().saturating_sub(1) {
+                app.selected += 1;
+            }
+            false
+        }
+        (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
+            if app.selected > 0 {
+                app.selected -= 1;
+            }
+            false
+        }
+        (KeyCode::Char('n'), KeyModifiers::CONTROL)
+        | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            if app.selected < app.active_matches().len().saturating_sub(1) {
+                app.selected += 1;
+            }
+            false
+        }
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            app.toggle_entry_mode();
+            false
+        }
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+            if app.selected > 0 {
+                app.selected -= 1;
+            }
+            false
+        }
+        (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+            if app.active_column != 0 {
+                app.active_column = 0;
+                if app.selected >= app.matches.len() {
+                    app.selected = app.matches.len().saturating_sub(1);
+                }
+            }
+            false
+        }
+        (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+            if app.active_column != 1 {
+                app.active_column = 1;
+                if app.selected >= app.matches_by_time.len() {
+                    app.selected = app.matches_by_time.len().saturating_sub(1);
+                }
+            }
+            false
+        }
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+            if let Some(file) = app.selected_file() {
+                let _ = Command::new("wl-copy")
+                    .arg(&file)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+            false
+        }
+        (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
+            app.toggle_search_scope();
+            false
+        }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            app.query.clear();
+            app.selected = 0;
+            false
+        }
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) | (KeyCode::Backspace, KeyModifiers::ALT) => {
+            while app.query.ends_with(' ') {
+                app.query.pop();
+            }
+            while !app.query.is_empty() && !app.query.ends_with(' ') {
+                app.query.pop();
+            }
+            app.selected = 0;
+            false
+        }
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            app.query.pop();
+            app.selected = 0;
+            false
+        }
+        (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            app.query.push(c);
+            app.selected = 0;
+            false
+        }
+        _ => false,
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--profile") {
@@ -5107,6 +5518,10 @@ fn main() -> io::Result<()> {
     if args.iter().any(|arg| arg == "--bench-flicker") {
         return run_bench_flicker();
     }
+    if args.iter().any(|arg| arg == "--bench-responsiveness") {
+        return run_bench_responsiveness();
+    }
+    let mut trace = TraceLogger::new(&args);
     let drag_mode = args.iter().any(|arg| arg == "--drag");
     let dir_mode = args.iter().any(|arg| arg == "--dir");
     let selection_path = args
@@ -5127,22 +5542,67 @@ fn main() -> io::Result<()> {
 
     let mut last_image_area: Option<Rect> = None;
     let mut last_rendered_path = String::new();
+    let mut last_input_time: Option<Instant> = None;
+    let mut pending_input_render: Option<(Instant, usize)> = None;
 
     loop {
+        let loop_start = Instant::now();
+        let phase_start = Instant::now();
         app.update_matches();
+        trace.log_duration(
+            "update_matches",
+            phase_start.elapsed(),
+            format!(
+                "query_len={} matches={}",
+                app.query.len(),
+                app.matches.len()
+            ),
+        );
+
+        let phase_start = Instant::now();
         app.update_preview();
+        trace.log_duration(
+            "update_preview",
+            phase_start.elapsed(),
+            format!("preview_path={:?}", app.preview_path),
+        );
 
         let mut image_area: Option<Rect> = None;
         let mut cursor_pos = (0u16, 0u16);
+        let draw_start = Instant::now();
         terminal.draw(|f| {
             let result = ui(f, &app);
             image_area = result.0;
             cursor_pos = result.1;
         })?;
+        trace.log_duration(
+            "tui_draw",
+            draw_start.elapsed(),
+            format!(
+                "query_len={} matches={}",
+                app.query.len(),
+                app.matches.len()
+            ),
+        );
+        if let Some((first_input_at, count)) = pending_input_render.take() {
+            trace.log(
+                "input_to_draw",
+                format!(
+                    "duration_us={} input_count={} query_len={} selected={}",
+                    first_input_at.elapsed().as_micros(),
+                    count,
+                    app.query.len(),
+                    app.selected
+                ),
+            );
+        }
 
         let input_pending = event::poll(Duration::from_millis(0))?;
+        let input_recent = last_input_time
+            .map(|at| at.elapsed() < Duration::from_millis(INPUT_RENDER_GRACE_MS))
+            .unwrap_or(false);
 
-        if !input_pending {
+        if !input_pending && !input_recent {
             if let Some(area) = image_area {
                 let inner = Rect {
                     x: area.x + 1,
@@ -5153,7 +5613,19 @@ fn main() -> io::Result<()> {
                 match &app.preview_content {
                     PreviewContent::Image(ref img) => {
                         if app.preview_path != last_rendered_path {
+                            let render_start = Instant::now();
                             let _ = render_kitty_image(img, inner, cursor_pos);
+                            trace.log_duration(
+                                "kitty_image_render",
+                                render_start.elapsed(),
+                                format!(
+                                    "path={:?} bytes={} dims={}x{}",
+                                    app.preview_path,
+                                    img.data.len(),
+                                    img.width,
+                                    img.height
+                                ),
+                            );
                             last_rendered_path = app.preview_path.clone();
                         }
                         last_image_area = Some(area);
@@ -5169,7 +5641,21 @@ fn main() -> io::Result<()> {
                             &last_rendered_path,
                         ) {
                             if let Some(frame) = frames.get(idx) {
+                                let render_start = Instant::now();
                                 let _ = render_kitty_image(frame, inner, cursor_pos);
+                                trace.log_duration(
+                                    "kitty_video_render",
+                                    render_start.elapsed(),
+                                    format!(
+                                        "path={:?} frame={} bytes={} dims={}x{} frames={}",
+                                        app.preview_path,
+                                        idx,
+                                        frame.data.len(),
+                                        frame.width,
+                                        frame.height,
+                                        frames.len()
+                                    ),
+                                );
                             }
                             last_rendered_path = app.preview_path.clone();
                         }
@@ -5178,10 +5664,20 @@ fn main() -> io::Result<()> {
                     _ => {}
                 }
             } else if last_image_area.is_some() {
+                let clear_start = Instant::now();
                 let _ = clear_kitty_image();
+                trace.log_duration("kitty_clear", clear_start.elapsed(), "");
                 last_image_area = None;
                 last_rendered_path.clear();
             }
+        } else if image_area.is_some() && trace.enabled() {
+            trace.log(
+                "preview_render_skipped_for_input",
+                format!(
+                    "input_pending={} input_recent={} grace_ms={} preview_path={:?}",
+                    input_pending, input_recent, INPUT_RENDER_GRACE_MS, app.preview_path
+                ),
+            );
         }
 
         // Poll with shorter timeout for smooth video, longer for static content
@@ -5191,111 +5687,92 @@ fn main() -> io::Result<()> {
             PreviewContent::VideoLoading => 50,
             _ => 100,
         };
+        let poll_start = Instant::now();
+        let mut should_exit = false;
         if event::poll(Duration::from_millis(poll_ms))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            trace.log_duration(
+                "event_wait_ready",
+                poll_start.elapsed(),
+                format!("poll_ms={}", poll_ms),
+            );
+
+            let mut drained_events = 0usize;
+            loop {
+                let read_start = Instant::now();
+                let event = event::read()?;
+                trace.log_duration("event_read", read_start.elapsed(), "");
+
+                if let Event::Key(key) = event {
+                    if key.kind == KeyEventKind::Press {
+                        let input_at = Instant::now();
+                        last_input_time = Some(input_at);
+                        if let Some((_, count)) = pending_input_render.as_mut() {
+                            *count += 1;
+                        } else {
+                            pending_input_render = Some((input_at, 1));
+                        }
+                        trace.log(
+                            "input_event",
+                            format!(
+                                "key={:?} modifiers={:?} query_len_before={} selected_before={} active_column={} drained_index={}",
+                                key.code,
+                                key.modifiers,
+                                app.query.len(),
+                                app.selected,
+                                app.active_column,
+                                drained_events
+                            ),
+                        );
+
+                        let handle_start = Instant::now();
+                        should_exit = handle_key_press(key, &mut app, &selection_path, &mut chosen);
+                        trace.log_duration(
+                            "input_handle",
+                            handle_start.elapsed(),
+                            format!(
+                                "query_len_after={} selected_after={} should_exit={}",
+                                app.query.len(),
+                                app.selected,
+                                should_exit
+                            ),
+                        );
+                    }
                 }
-                match (key.code, key.modifiers) {
-                    (KeyCode::Esc, _) => break,
-                    (KeyCode::Enter, _) => {
-                        if let Some(file) = app.selected_file() {
-                            if selection_path.is_some() {
-                                chosen = Some(ExitAction::Choose(file));
-                            } else if app.drag_mode {
-                                chosen = Some(ExitAction::Drag(file));
-                            } else {
-                                chosen = Some(ExitAction::Open(file));
-                            }
-                        }
-                        break;
-                    }
-                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                        if let Some(file) = app.selected_file() {
-                            chosen = Some(ExitAction::Drag(file));
-                        }
-                        break;
-                    }
-                    (KeyCode::Down, _) | (KeyCode::Tab, KeyModifiers::NONE) => {
-                        if app.selected < app.active_matches().len().saturating_sub(1) {
-                            app.selected += 1;
-                        }
-                    }
-                    (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
-                        if app.selected > 0 {
-                            app.selected -= 1;
-                        }
-                    }
-                    (KeyCode::Char('n'), KeyModifiers::CONTROL)
-                    | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                        if app.selected < app.active_matches().len().saturating_sub(1) {
-                            app.selected += 1;
-                        }
-                    }
-                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                        app.toggle_entry_mode();
-                    }
-                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                        if app.selected > 0 {
-                            app.selected -= 1;
-                        }
-                    }
-                    (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-                        if app.active_column != 0 {
-                            app.active_column = 0;
-                            if app.selected >= app.matches.len() {
-                                app.selected = app.matches.len().saturating_sub(1);
-                            }
-                        }
-                    }
-                    (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-                        if app.active_column != 1 {
-                            app.active_column = 1;
-                            if app.selected >= app.matches_by_time.len() {
-                                app.selected = app.matches_by_time.len().saturating_sub(1);
-                            }
-                        }
-                    }
-                    (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
-                        if let Some(file) = app.selected_file() {
-                            let _ = Command::new("wl-copy")
-                                .arg(&file)
-                                .stdin(Stdio::null())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .spawn();
-                        }
-                    }
-                    (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
-                        app.toggle_search_scope();
-                    }
-                    (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                        app.query.clear();
-                        app.selected = 0;
-                    }
-                    (KeyCode::Char('w'), KeyModifiers::CONTROL)
-                    | (KeyCode::Backspace, KeyModifiers::ALT) => {
-                        // Delete word
-                        while app.query.ends_with(' ') {
-                            app.query.pop();
-                        }
-                        while !app.query.is_empty() && !app.query.ends_with(' ') {
-                            app.query.pop();
-                        }
-                        app.selected = 0;
-                    }
-                    (KeyCode::Backspace, KeyModifiers::NONE) => {
-                        app.query.pop();
-                        app.selected = 0;
-                    }
-                    (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                        app.query.push(c);
-                        app.selected = 0;
-                    }
-                    _ => {}
+
+                drained_events += 1;
+                if should_exit {
+                    break;
+                }
+                if drained_events >= INPUT_DRAIN_LIMIT {
+                    trace.log(
+                        "input_drain_limit",
+                        format!(
+                            "limit={} query_len={} selected={}",
+                            INPUT_DRAIN_LIMIT,
+                            app.query.len(),
+                            app.selected
+                        ),
+                    );
+                    break;
+                }
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
                 }
             }
         }
+        if should_exit {
+            break;
+        }
+        trace.log_duration(
+            "event_loop",
+            loop_start.elapsed(),
+            format!(
+                "query_len={} matches={} preview_path={:?}",
+                app.query.len(),
+                app.matches.len(),
+                app.preview_path
+            ),
+        );
     }
 
     // Clear any kitty graphics before exiting

@@ -66,6 +66,8 @@ profile: hot cache access in 14µs
 ffp              # Launch file picker
 ffp --dir        # Launch directory picker
 ffp --profile    # Run performance profiler
+ffp --bench-responsiveness  # Benchmark input/search/preview responsiveness
+ffp --trace-responsive      # Log slow input/render events to ~/.local/state/ffp/responsiveness.log
 ```
 
 By default, `ffp` searches files only. Use `--dir` to start in directory mode, or press `Ctrl+P` in the app to toggle between files and directories.
