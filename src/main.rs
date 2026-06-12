@@ -51,6 +51,9 @@ const ENTRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 const STAT_WORKER_MAX: usize = 8;
 const FILE_LOOKBACK_WINDOW: &str = "9d";
 const FILE_LOOKBACK_WINDOW_SECS: u64 = 9 * 24 * 60 * 60;
+/// UI label for the recent scope, including the lookback cutoff.
+/// Keep in sync with FILE_LOOKBACK_WINDOW.
+const RECENT_SCOPE_LABEL: &str = "recent (9d)";
 const RECENT_POOL_LIMIT: usize = 20_000;
 const IMAGE_CACHE_SIZE: usize = 10;
 const THUMBNAIL_MAX_WIDTH: u32 = 800;
@@ -471,9 +474,11 @@ enum SearchScope {
 }
 
 impl SearchScope {
+    /// Label shown in the search box and status line. Recent includes its
+    /// time cutoff (e.g. "recent (9d)") so the active window is visible.
     fn label(self) -> &'static str {
         match self {
-            Self::Recent => "recent",
+            Self::Recent => RECENT_SCOPE_LABEL,
             Self::All => "all",
         }
     }
@@ -2219,12 +2224,8 @@ fn video_render_decision(
 /// responsible for flushing and for hiding/showing the cursor so that
 /// the entire write (cursor-hide + kitty data + cursor-restore) lands
 /// in a single `flush()` call, preventing partial-write flicker.
-fn render_kitty_image_to(
-    img: &CachedImage,
-    area: Rect,
-    image_id: u32,
-    out: &mut impl Write,
-) -> io::Result<()> {
+/// Compute the cell box (cols, rows, offsets) an image scales into.
+fn kitty_layout(img: &CachedImage, area: Rect) -> (u32, u32, u32, u32) {
     let cell_ratio = 2.0_f64;
     let img_ratio = (img.width as f64 / img.height as f64) * cell_ratio;
     let area_ratio = area.width as f64 / area.height as f64;
@@ -2241,14 +2242,13 @@ fn render_kitty_image_to(
 
     let offset_x = (area.width as u32).saturating_sub(cols) / 2;
     let offset_y = (area.height as u32).saturating_sub(rows) / 2;
+    (cols, rows, offset_x, offset_y)
+}
 
-    write!(
-        out,
-        "\x1b[{};{}H",
-        area.y as u32 + 1 + offset_y,
-        area.x as u32 + 1 + offset_x
-    )?;
-
+/// Transmit image data only (kitty `a=t`): no display, no cursor movement.
+/// The payload can be hundreds of KB; because it neither displays nor moves
+/// the cursor, it is safe to send while the input cursor is visible.
+fn kitty_transmit_to(img: &CachedImage, image_id: u32, out: &mut impl Write) -> io::Result<()> {
     let b64_data = BASE64.encode(img.data.as_slice());
 
     let chunk_size = 4096;
@@ -2264,22 +2264,18 @@ fn render_kitty_image_to(
             if img.is_raw_rgb {
                 write!(
                     out,
-                    "\x1b_Ga=T,q=2,i={},C=1,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
+                    "\x1b_Ga=t,q=2,i={},f=24,s={},v={},m={};{}\x1b\\",
                     image_id,
                     img.width,
                     img.height,
-                    cols,
-                    rows,
                     if is_last { 0 } else { 1 },
                     chunk
                 )?;
             } else {
                 write!(
                     out,
-                    "\x1b_Ga=T,q=2,i={},C=1,f=100,c={},r={},m={};{}\x1b\\",
+                    "\x1b_Ga=t,q=2,i={},f=100,m={};{}\x1b\\",
                     image_id,
-                    cols,
-                    rows,
                     if is_last { 0 } else { 1 },
                     chunk
                 )?;
@@ -2294,6 +2290,39 @@ fn render_kitty_image_to(
         }
     }
 
+    Ok(())
+}
+
+/// Display a previously transmitted image (kitty `a=p`): cursor move into
+/// the preview area plus a tiny placement command. This is the only part
+/// that needs the cursor hidden, and it is a few dozen bytes.
+fn kitty_place_to(
+    img: &CachedImage,
+    area: Rect,
+    image_id: u32,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let (cols, rows, offset_x, offset_y) = kitty_layout(img, area);
+    write!(
+        out,
+        "\x1b[{};{}H",
+        area.y as u32 + 1 + offset_y,
+        area.x as u32 + 1 + offset_x
+    )?;
+    write!(out, "\x1b_Ga=p,q=2,i={},C=1,c={},r={}\x1b\\", image_id, cols, rows)?;
+    Ok(())
+}
+
+/// Transmit + place in one stream (used by tests/benches that exercise the
+/// full per-frame byte sequence).
+fn render_kitty_image_to(
+    img: &CachedImage,
+    area: Rect,
+    image_id: u32,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    kitty_transmit_to(img, image_id, out)?;
+    kitty_place_to(img, area, image_id, out)?;
     Ok(())
 }
 
@@ -2325,12 +2354,18 @@ impl KittyDoubleBuffer {
 
 /// Render image using kitty graphics protocol.
 ///
-/// Composes one atomic buffer: hide cursor, draw the new frame under a
-/// fresh image id, delete the previously displayed id, move the cursor
-/// back to the input field, show it again, then a single
-/// write_all + flush. The cursor-move into the preview area therefore
-/// always happens while the cursor is hidden, and the old frame stays
-/// on screen until the new one covers it (no blank gap between frames).
+/// Two-phase, double-buffered, in one flush:
+/// 1. Transmit the frame data (`a=t`) under a fresh image id. This is the
+///    bulky part (hundreds of KB) and touches neither the screen nor the
+///    cursor, so the input cursor stays visible and steady through it.
+/// 2. A tiny atomic tail: hide cursor, place the new frame (`a=p`) over
+///    the old one, delete the old id, move the cursor back to the input
+///    field, show it. ~60 bytes, far below any terminal coalescing
+///    threshold, so the hidden-cursor window is imperceptible.
+///
+/// Hiding the cursor for the whole transmission (the previous approach)
+/// blanked the input cursor for multiple milliseconds out of every 100ms
+/// frame interval, which made the insert block visibly strobe.
 fn render_kitty_image(
     img: &CachedImage,
     area: Rect,
@@ -2338,7 +2373,7 @@ fn render_kitty_image(
     dbuf: &mut KittyDoubleBuffer,
 ) -> io::Result<()> {
     let (new_id, old_id) = dbuf.flip();
-    let mut buf: Vec<u8> = Vec::with_capacity(img.data.len() * 2 + 64);
+    let mut buf: Vec<u8> = Vec::with_capacity(img.data.len() * 2 + 96);
     compose_kitty_render(img, area, cursor_pos, new_id, old_id, &mut buf)?;
     let mut out = io::stdout().lock();
     out.write_all(&buf)?;
@@ -2346,12 +2381,12 @@ fn render_kitty_image(
     Ok(())
 }
 
-/// Build the full atomic render sequence for one frame:
-/// `hide cursor` + `kitty image (new id)` + `delete old id` +
-/// `cursor back to input` + `show cursor`.
-/// Everything must land in one buffer so a terminal can never paint an
-/// intermediate state: no visible cursor inside the preview area, and no
-/// moment where neither frame is displayed.
+/// Build the full per-frame byte sequence:
+/// `transmit new id (cursor untouched)` + `hide cursor` + `place new id` +
+/// `delete old id` + `cursor back to input` + `show cursor`.
+/// The display tail must stay contiguous in one buffer so a terminal can
+/// never paint an intermediate state: no visible cursor inside the preview
+/// area, and no moment where neither frame is displayed.
 fn compose_kitty_render(
     img: &CachedImage,
     area: Rect,
@@ -2360,8 +2395,9 @@ fn compose_kitty_render(
     old_id: u32,
     out: &mut impl Write,
 ) -> io::Result<()> {
+    kitty_transmit_to(img, new_id, out)?;
     write!(out, "\x1b[?25l")?;
-    render_kitty_image_to(img, area, new_id, out)?;
+    kitty_place_to(img, area, new_id, out)?;
     // Delete the previous frame only after the new one is placed over it.
     write!(out, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", old_id)?;
     write!(
@@ -4393,6 +4429,17 @@ mod tests {
         ));
     }
 
+    /// The UI label must always advertise the same cutoff that the recent
+    /// loader actually uses for filtering.
+    #[test]
+    fn recent_scope_label_shows_lookback_cutoff() {
+        assert_eq!(
+            SearchScope::Recent.label(),
+            format!("recent ({})", FILE_LOOKBACK_WINDOW)
+        );
+        assert_eq!(SearchScope::All.label(), "all");
+    }
+
     #[test]
     fn history_path_escaping_round_trips() {
         let path = "/tmp/ffp path/with\\slashes\tand\nnewlines.txt";
@@ -4589,7 +4636,7 @@ mod tests {
         assert!(!cmds.is_empty(), "should emit at least one kitty command");
 
         let header = get_kitty_header(&cmds[0]);
-        assert!(header.contains("a=T"), "action should be transmit+display");
+        assert!(header.contains("a=t"), "first command transmits data only");
         assert!(
             header.contains("q=2"),
             "must have quiet mode to suppress responses"
@@ -4600,6 +4647,10 @@ mod tests {
         );
         assert!(header.contains("f=100"), "PNG data must use f=100");
         assert!(!header.contains("f=24"), "PNG data must not use f=24");
+
+        let place = get_kitty_header(cmds.last().unwrap());
+        assert!(place.contains("a=p"), "must end with a placement command");
+        assert!(place.contains("i=1"), "placement must reference image ID 1");
     }
 
     #[test]
@@ -4670,7 +4721,13 @@ mod tests {
             "first chunk must signal more data (m=1)"
         );
 
-        for cmd in &cmds[1..cmds.len() - 1] {
+        // The final command is the placement (a=p); chunked transmit data
+        // is everything before it.
+        let place_header = get_kitty_header(cmds.last().unwrap());
+        assert!(place_header.contains("a=p"), "must end with placement");
+        let chunks = &cmds[..cmds.len() - 1];
+
+        for cmd in &chunks[1..chunks.len() - 1] {
             let h = get_kitty_header(cmd);
             assert!(h.contains("m=1"), "middle chunk must have m=1");
             assert!(
@@ -4679,10 +4736,10 @@ mod tests {
             );
         }
 
-        let last_header = get_kitty_header(cmds.last().unwrap());
+        let last_header = get_kitty_header(chunks.last().unwrap());
         assert!(
             last_header.contains("m=0"),
-            "last chunk must signal end (m=0)"
+            "last transmit chunk must signal end (m=0)"
         );
     }
 
@@ -4719,16 +4776,17 @@ mod tests {
         );
     }
 
-    /// The single composed frame buffer must be: hide cursor, kitty image,
-    /// cursor reposition to input, show cursor — in exactly that order, so
-    /// the cursor can never be painted inside the preview area.
+    /// The composed frame must be: bulky transmit (cursor untouched), then
+    /// a tiny atomic display tail of hide → place → delete old → reposition
+    /// → show. The hide window must exclude the large transmit payload so
+    /// the input cursor does not visibly strobe each video frame.
     #[test]
     fn compose_kitty_render_is_atomic_hide_draw_restore() {
         let img = CachedImage {
-            data: Arc::new(vec![0u8; 64]),
-            width: 16,
-            height: 16,
-            is_raw_rgb: false,
+            data: Arc::new(vec![0u8; 64 * 1024]),
+            width: 160,
+            height: 90,
+            is_raw_rgb: true,
         };
         let area = Rect {
             x: 60,
@@ -4742,15 +4800,16 @@ mod tests {
         compose_kitty_render(&img, area, cursor_pos, 2, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf).to_string();
 
-        let hide = output.find("\x1b[?25l").expect("must hide cursor first");
-        let kitty = output.find("\x1b_G").expect("must contain kitty payload");
+        let transmit = output.find("a=t").expect("must transmit data first");
+        let hide = output.find("\x1b[?25l").expect("must hide cursor");
+        let place = output.find("a=p").expect("must place the new frame");
         let restore = output
             .find(&format!("\x1b[{};{}H\x1b[?25h", cursor_pos.1 + 1, cursor_pos.0 + 1))
             .expect("must move cursor back to input before showing it");
-        let show = output.rfind("\x1b[?25h").unwrap();
 
-        assert!(hide < kitty, "hide must precede the kitty image");
-        assert!(kitty < restore, "reposition must follow the kitty image");
+        assert!(transmit < hide, "transmit happens before the cursor hide");
+        assert!(hide < place, "hide must precede the placement");
+        assert!(place < restore, "reposition must follow the placement");
         assert_eq!(
             output.matches("\x1b[?25h").count(),
             1,
@@ -4765,22 +4824,28 @@ mod tests {
             output.ends_with("\x1b[?25h"),
             "buffer must end with the cursor visible at the input field"
         );
-        assert!(show > kitty);
 
-        // Double-buffer ordering: the new frame (i=2) must be fully
-        // transmitted before the old frame (i=1) is deleted, so the area is
-        // never blank between frames.
-        let new_frame = output.find("i=2").expect("new frame id present");
+        // The hidden-cursor window must be tiny: place + delete + restore
+        // only, far below one transmit chunk.
+        let hidden_window = output.len() - hide;
+        assert!(
+            hidden_window < 128,
+            "cursor-hidden tail must be tiny, got {} bytes",
+            hidden_window
+        );
+
+        // Double-buffer ordering: the new frame (i=2) must be placed before
+        // the old frame (i=1) is deleted, so the area is never blank.
         let delete_old = output
             .find("\x1b_Ga=d,d=I,i=1,q=2\x1b\\")
             .expect("must delete the old frame id");
         assert!(
-            new_frame < delete_old,
+            place < delete_old,
             "old frame must only be deleted after the new frame is placed"
         );
         assert!(
             delete_old < restore,
-            "delete must happen inside the atomic buffer before cursor restore"
+            "delete must happen inside the atomic tail before cursor restore"
         );
     }
 
@@ -4839,9 +4904,11 @@ mod tests {
         let output = String::from_utf8_lossy(&buf);
         let cmds = parse_kitty_commands(&output);
         assert!(!cmds.is_empty());
+        let place = get_kitty_header(cmds.last().unwrap());
+        assert!(place.contains("a=p"), "last command must be the placement");
         assert!(
-            get_kitty_header(&cmds[0]).contains("C=1"),
-            "kitty image must use C=1 (do not move cursor)"
+            place.contains("C=1"),
+            "placement must use C=1 (do not move cursor)"
         );
     }
 
@@ -4940,7 +5007,8 @@ mod tests {
         let output = String::from_utf8_lossy(&buf);
 
         let cmds = parse_kitty_commands(&output);
-        let header = get_kitty_header(&cmds[0]);
+        // Scaling now lives on the placement command (a=p), the last one.
+        let header = get_kitty_header(cmds.last().unwrap());
 
         let c_val: u32 = header
             .split(',')
@@ -5329,28 +5397,31 @@ mod tests {
 
         let output = String::from_utf8_lossy(&terminal_bytes).to_string();
 
-        let kitty_positions: Vec<usize> =
-            output.match_indices("\x1b_G").map(|(pos, _)| pos).collect();
+        // Transmit-only commands (a=t) are cursor-safe by design; only the
+        // placements (a=p) actually draw, so only they require the cursor
+        // to be hidden.
+        let place_positions: Vec<usize> = output
+            .match_indices("\x1b_Ga=p")
+            .map(|(pos, _)| pos)
+            .collect();
 
-        for &kpos in &kitty_positions {
+        for &kpos in &place_positions {
             let before = &output[..kpos];
             let last_show = before.rfind("\x1b[?25h");
             let last_hide = before.rfind("\x1b[?25l");
 
-            // Every kitty write must happen while the cursor is hidden:
-            // the most recent visibility change before it must be a hide.
-            let hide_pos = last_hide.expect("kitty write without a preceding cursor hide");
+            let hide_pos = last_hide.expect("placement without a preceding cursor hide");
             if let Some(show_pos) = last_show {
                 assert!(
                     hide_pos > show_pos,
-                    "cursor was visible when a kitty frame was written"
+                    "cursor was visible when a frame placement was written"
                 );
             }
         }
 
         assert!(
-            !kitty_positions.is_empty(),
-            "should have rendered at least one kitty frame"
+            !place_positions.is_empty(),
+            "should have rendered at least one kitty frame placement"
         );
         assert!(
             output.ends_with("\x1b[?25h") || output.contains("\x1b[?25h"),
@@ -6209,10 +6280,18 @@ fn analyze_writes(label: &str, writes: &[(Instant, usize, Vec<u8>)], elapsed: Du
                     pos += 1;
                 }
             } else if s[pos..].starts_with("\x1b_G") {
-                kitty_renders += 1;
-                if cursor_visible {
-                    kitty_while_visible += 1;
-                    flicker_count += 1;
+                // Only display-affecting commands (place/transmit+display)
+                // matter for flicker; data-only transmits (a=t) and deletes
+                // never paint pixels under the cursor.
+                let header_end = s[pos..].find(';').map(|e| pos + e).unwrap_or(s.len());
+                let header = &s[pos..header_end];
+                let displays = header.contains("a=p") || header.contains("a=T");
+                if displays {
+                    kitty_renders += 1;
+                    if cursor_visible {
+                        kitty_while_visible += 1;
+                        flicker_count += 1;
+                    }
                 }
                 if let Some(end) = s[pos + 2..].find("\x1b\\") {
                     pos += 2 + end + 2;
