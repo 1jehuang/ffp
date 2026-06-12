@@ -5507,6 +5507,13 @@ fn open_file(path: &str) -> Result<(), String> {
     }
 }
 
+/// Terminal column width of the query for cursor placement. byte len breaks
+/// on multibyte input; char count is the practical approximation without a
+/// full grapheme/width crate (kept consistent with ratatui's rendering).
+fn query_display_width(query: &str) -> u16 {
+    query.chars().count().min(u16::MAX as usize) as u16
+}
+
 fn build_file_items<'a>(matches: &[MatchEntry], files: &[FileEntry]) -> Vec<ListItem<'a>> {
     matches
         .iter()
@@ -5771,7 +5778,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         );
 
         let cursor_pos = (
-            left_chunks[0].x + app.query.len() as u16 + 1,
+            left_chunks[0].x + query_display_width(&app.query) + 1,
             left_chunks[0].y + 1,
         );
         frame.set_cursor_position(cursor_pos);
@@ -5814,7 +5821,7 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         );
 
         let cursor_pos = (
-            left_chunks[0].x + app.query.len() as u16 + 1,
+            left_chunks[0].x + query_display_width(&app.query) + 1,
             left_chunks[0].y + 1,
         );
         frame.set_cursor_position(cursor_pos);
@@ -5852,7 +5859,10 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
         frame.render_widget(status_widget, chunks[3]);
         frame.render_widget(help_widget, chunks[4]);
 
-        let cursor_pos = (chunks[0].x + app.query.len() as u16 + 1, chunks[0].y + 1);
+        let cursor_pos = (
+            chunks[0].x + query_display_width(&app.query) + 1,
+            chunks[0].y + 1,
+        );
         frame.set_cursor_position(cursor_pos);
 
         (chunks[2], cursor_pos)
@@ -6445,6 +6455,7 @@ fn handle_key_press(
             app.toggle_search_scope();
             false
         }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => true,
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
             app.query.clear();
             app.selected = 0;
@@ -6496,7 +6507,17 @@ fn main() -> io::Result<()> {
         .position(|arg| arg == "--selection-path")
         .and_then(|i| args.get(i + 1).cloned());
 
-    // Setup terminal
+    // Setup terminal. Install a panic hook first so a panic in the render
+    // loop cannot leave the user's shell in raw mode + alternate screen
+    // with kitty images still on screen.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let mut out = io::stdout();
+        let _ = clear_kitty_image_to(&mut out);
+        let _ = disable_raw_mode();
+        let _ = execute!(out, LeaveAlternateScreen);
+        default_panic(info);
+    }));
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -6580,7 +6601,12 @@ fn main() -> io::Result<()> {
                 };
                 match &app.preview_content {
                     PreviewContent::Image(ref img) => {
-                        if app.preview_path != last_rendered_path {
+                        // Re-render when the path changes or the preview area
+                        // moved/resized (e.g. terminal resize), otherwise the
+                        // image stays at its stale position and scale.
+                        if app.preview_path != last_rendered_path
+                            || last_image_area != Some(area)
+                        {
                             let render_start = Instant::now();
                             let _ = render_kitty_image(img, inner, cursor_pos, &mut kitty_dbuf);
                             trace.log_duration(
@@ -6600,6 +6626,11 @@ fn main() -> io::Result<()> {
                     }
                     PreviewContent::Video(ref frames)
                     | PreviewContent::VideoStreaming(ref frames) => {
+                        // Force a frame render after a move/resize so the
+                        // video re-anchors to the new preview area.
+                        if last_image_area != Some(area) {
+                            last_rendered_path.clear();
+                        }
                         if let Some(idx) = video_render_decision(
                             app.video_frame_time.elapsed(),
                             &mut app.video_frame,
