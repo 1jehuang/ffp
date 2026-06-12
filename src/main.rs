@@ -7,7 +7,6 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use image::GenericImageView;
-use rapidfuzz::fuzz::ratio;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -1456,7 +1455,7 @@ fn flush_entry_buffer(
     cap_recent_pool: bool,
 ) {
     if !buffer.is_empty() {
-        loaded.extend(buffer.drain(..));
+        loaded.append(buffer);
         if cap_recent_pool && loaded.len() >= RECENT_POOL_LIMIT * 2 {
             loaded.sort_by(compare_entries_by_recency);
             loaded.truncate(RECENT_POOL_LIMIT);
@@ -2348,6 +2347,7 @@ fn fuzzy_match_incremental(
     }
 
     if query.chars().count() >= INCREMENTAL_QUERY_MIN_CHARS
+        && state.last_query.chars().count() >= INCREMENTAL_QUERY_MIN_CHARS
         && query.starts_with(&state.last_query)
         && !state.last_query.is_empty()
         && !state.last_candidates.is_empty()
@@ -2417,7 +2417,13 @@ fn score_all_files(
     let mut warm_candidates = Vec::new();
 
     for (index, entry) in files.iter().enumerate() {
-        if let Some(score) = file_match_score(&query_lower, &query_words, entry) {
+        if let Some(score) = file_match_score(
+            &query_lower,
+            &query_words,
+            entry,
+            false,
+            query_words.len() > 1,
+        ) {
             results.push(MatchEntry { index, score });
         }
 
@@ -2425,6 +2431,23 @@ fn score_all_files(
             && is_incremental_warm_candidate(&query_compact, query_char_count, &query_words, entry)
         {
             warm_candidates.push(index);
+        }
+    }
+
+    if should_accept_fast_match_pass(results.len(), limit, query_words.len()) {
+        let (matches, candidates) = trim_sort_matches(results, limit, candidate_limit);
+        let candidates = merge_candidate_pool(candidates, warm_candidates, candidate_limit);
+        return (matches, candidates);
+    }
+
+    let mut seen: HashSet<usize> = results.iter().map(|matched| matched.index).collect();
+    for (index, entry) in files.iter().enumerate() {
+        if seen.contains(&index) {
+            continue;
+        }
+        if let Some(score) = file_match_score(&query_lower, &query_words, entry, true, true) {
+            seen.insert(index);
+            results.push(MatchEntry { index, score });
         }
     }
 
@@ -2452,8 +2475,30 @@ fn score_candidate_indexes(
         let Some(entry) = files.get(index) else {
             continue;
         };
-        if let Some(score) = file_match_score(&query_lower, &query_words, entry) {
+        if let Some(score) = file_match_score(
+            &query_lower,
+            &query_words,
+            entry,
+            false,
+            query_words.len() > 1,
+        ) {
             results.push(MatchEntry { index, score });
+        }
+    }
+
+    if !should_accept_fast_match_pass(results.len(), limit, query_words.len()) {
+        let mut seen: HashSet<usize> = results.iter().map(|matched| matched.index).collect();
+        for &index in indexes {
+            if seen.contains(&index) {
+                continue;
+            }
+            let Some(entry) = files.get(index) else {
+                continue;
+            };
+            if let Some(score) = file_match_score(&query_lower, &query_words, entry, true, true) {
+                seen.insert(index);
+                results.push(MatchEntry { index, score });
+            }
         }
     }
 
@@ -2523,6 +2568,17 @@ fn chars_in_order(needle: &str, haystack: &str) -> bool {
         .all(|needle_ch| haystack.any(|hay_ch| hay_ch == needle_ch))
 }
 
+fn compare_match_entries(a: &MatchEntry, b: &MatchEntry) -> Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.index.cmp(&b.index))
+}
+
+fn should_accept_fast_match_pass(match_count: usize, limit: usize, word_count: usize) -> bool {
+    match_count >= limit || (word_count > 1 && match_count > 0)
+}
+
 fn trim_sort_matches(
     mut results: Vec<MatchEntry>,
     limit: usize,
@@ -2530,64 +2586,277 @@ fn trim_sort_matches(
 ) -> (Vec<MatchEntry>, Vec<usize>) {
     let keep = candidate_limit.max(limit).min(results.len());
     if keep > 0 && results.len() > keep {
-        results.select_nth_unstable_by(keep, |a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
-        });
+        results.select_nth_unstable_by(keep, compare_match_entries);
         results.truncate(keep);
     }
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    results.sort_by(compare_match_entries);
     let candidates = results.iter().map(|matched| matched.index).collect();
     results.truncate(limit);
     (results, candidates)
 }
 
-fn file_match_score(query_lower: &str, query_words: &[&str], entry: &FileEntry) -> Option<f64> {
-    let ratio_score = ratio(query_lower.chars(), entry.name_lower.chars()) * 100.0;
+fn file_match_score(
+    query_lower: &str,
+    query_words: &[&str],
+    entry: &FileEntry,
+    allow_typos: bool,
+    include_path: bool,
+) -> Option<f64> {
+    if query_words.is_empty() {
+        return None;
+    }
 
-    let name_score = if should_run_name_typo_match(ratio_score, query_words, &entry.name_lower) {
-        typo_match_text_score(query_words, &entry.name_lower, 10_000.0)
-    } else {
+    let name_score = fuzzy_match_text_score(query_words, &entry.name_lower, 10_000.0, allow_typos);
+    let path_score = if !include_path
+        || entry.path_lower == entry.name_lower
+        || !should_score_path(query_lower, query_words, name_score, entry)
+    {
         None
-    };
-    let path_score = if query_words.len() <= 1 || entry.path_lower == entry.name_lower {
-        None
     } else {
-        typo_match_text_score(query_words, &entry.path_lower, 6_000.0)
+        let allow_path_typos = allow_typos && query_words.len() > 1;
+        fuzzy_match_text_score(query_words, &entry.path_lower, 6_000.0, allow_path_typos)
     };
 
     name_score
         .into_iter()
         .chain(path_score)
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-        .map(|score| score + ratio_score / 10.0)
-        .or_else(|| (ratio_score > 35.0).then_some(ratio_score))
 }
 
-fn should_run_name_typo_match(ratio_score: f64, query_words: &[&str], name: &str) -> bool {
-    if ratio_score >= 45.0 {
+fn should_score_path(
+    query_lower: &str,
+    query_words: &[&str],
+    name_score: Option<f64>,
+    entry: &FileEntry,
+) -> bool {
+    if query_words.len() > 1 || name_score.is_none() {
         return true;
     }
 
-    query_words
-        .iter()
-        .any(|word| word.len() > 2 && name.contains(word))
+    let compact_query = query_lower.trim();
+    compact_query.len() >= 2
+        && !entry.name_lower.contains(compact_query)
+        && entry.path_lower.contains(compact_query)
 }
 
-fn typo_match_text_score(words: &[&str], text: &str, base_score: f64) -> Option<f64> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FuzzyWordMatchKind {
+    Exact,
+    Subsequence,
+    Typo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FuzzyWordMatch {
+    kind: FuzzyWordMatchKind,
+    cost: usize,
+    start: usize,
+    span_len: usize,
+}
+
+fn fuzzy_match_text_score(
+    words: &[&str],
+    text: &str,
+    base_score: f64,
+    allow_typos: bool,
+) -> Option<f64> {
     let mut score = base_score;
 
     for word in words {
-        let matched = typo_match_word(word, text)?;
-        let exact_bonus = if matched.cost == 0 { 50.0 } else { 0.0 };
-        let prefix_bonus = if matched.start == 0 { 100.0 } else { 0.0 };
-        score += 300.0 + exact_bonus + prefix_bonus;
-        score += matched.span_len as f64 * 20.0;
-        score -= matched.start as f64 * 2.0;
-        score -= matched.cost as f64 * 100.0;
+        let matched = fuzzy_match_word(word, text, allow_typos)?;
+        score += score_fuzzy_word_match(word, text, matched);
     }
 
     Some(score)
+}
+
+fn fuzzy_match_word(word: &str, text: &str, allow_typos: bool) -> Option<FuzzyWordMatch> {
+    if word.is_empty() {
+        return Some(FuzzyWordMatch {
+            kind: FuzzyWordMatchKind::Exact,
+            cost: 0,
+            start: 0,
+            span_len: 0,
+        });
+    }
+
+    if let Some(start) = text.find(word) {
+        return Some(FuzzyWordMatch {
+            kind: FuzzyWordMatchKind::Exact,
+            cost: 0,
+            start,
+            span_len: word.chars().count(),
+        });
+    }
+
+    let word_char_count = word.chars().count();
+    if word_char_count >= 2 {
+        if let Some(matched) = subsequence_match_word(word, text, word_char_count) {
+            return Some(matched);
+        }
+    }
+
+    if allow_typos && word_char_count > 2 {
+        if let Some(matched) = typo_match_word_segmented(word, text) {
+            return Some(FuzzyWordMatch {
+                kind: FuzzyWordMatchKind::Typo,
+                cost: matched.cost,
+                start: matched.start,
+                span_len: matched.span_len,
+            });
+        }
+    }
+
+    None
+}
+
+fn subsequence_match_word(
+    word: &str,
+    text: &str,
+    word_char_count: usize,
+) -> Option<FuzzyWordMatch> {
+    let max_span = (word_char_count * 4).max(12);
+    let mut word_chars = word.chars();
+    let mut next = word_chars.next()?;
+    let mut start = None;
+    let mut matched = 0usize;
+
+    for (byte_index, ch) in text.char_indices() {
+        if ch != next {
+            continue;
+        }
+
+        start.get_or_insert(byte_index);
+        matched += 1;
+
+        if let Some(next_ch) = word_chars.next() {
+            next = next_ch;
+        } else {
+            let start = start.unwrap_or(byte_index);
+            let span_len = text[start..=byte_index].chars().count();
+            if span_len <= max_span {
+                return Some(FuzzyWordMatch {
+                    kind: FuzzyWordMatchKind::Subsequence,
+                    cost: span_len.saturating_sub(matched),
+                    start,
+                    span_len,
+                });
+            }
+            return None;
+        }
+    }
+
+    None
+}
+
+fn typo_match_word_segmented(word: &str, text: &str) -> Option<TypoWordMatch> {
+    let word_len = word.chars().count();
+    let max_dist = if word_len <= 4 { 1 } else { 2 };
+    if !has_typo_candidate_overlap(word, text, max_dist) {
+        return None;
+    }
+
+    let mut best: Option<TypoWordMatch> = None;
+    let mut segment_start = None;
+
+    for (index, ch) in text.char_indices().chain(std::iter::once((text.len(), '/'))) {
+        if is_match_separator(ch) {
+            if let Some(start) = segment_start.take() {
+                consider_typo_segment(word, text, start, index, &mut best);
+            }
+        } else if segment_start.is_none() {
+            segment_start = Some(index);
+        }
+    }
+
+    best
+}
+
+fn consider_typo_segment(
+    word: &str,
+    text: &str,
+    start: usize,
+    end: usize,
+    best: &mut Option<TypoWordMatch>,
+) {
+    if start >= end {
+        return;
+    }
+
+    let segment = &text[start..end];
+    let word_len = word.chars().count();
+    let segment_len = segment.chars().count();
+    let max_dist = if word_len <= 4 { 1 } else { 2 };
+    if segment_len + max_dist < word_len || word_len + max_dist < segment_len {
+        return;
+    }
+
+    let Some(mut matched) = typo_match_word(word, segment) else {
+        return;
+    };
+    matched.start += start;
+
+    let replace = best
+        .as_ref()
+        .map(|current| {
+            matched.cost < current.cost
+                || (matched.cost == current.cost
+                    && (matched.start < current.start
+                        || (matched.start == current.start && matched.span_len < current.span_len)))
+        })
+        .unwrap_or(true);
+    if replace {
+        *best = Some(matched);
+    }
+}
+
+fn is_match_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        '/' | '\\' | '-' | '_' | '.' | ' ' | ':' | ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}'
+    )
+}
+
+fn score_fuzzy_word_match(word: &str, text: &str, matched: FuzzyWordMatch) -> f64 {
+    let word_len = word.chars().count() as f64;
+    let prefix_bonus = if matched.start == 0 { 180.0 } else { 0.0 };
+    let boundary_bonus = if is_match_boundary(text, matched.start) {
+        140.0
+    } else {
+        0.0
+    };
+    let start_penalty = matched.start.min(160) as f64 * 0.8;
+
+    match matched.kind {
+        FuzzyWordMatchKind::Exact => {
+            700.0 + word_len * 36.0 + prefix_bonus + boundary_bonus - start_penalty
+        }
+        FuzzyWordMatchKind::Subsequence => {
+            let gap_penalty = matched.cost as f64 * 35.0;
+            460.0 + word_len * 30.0 + prefix_bonus + boundary_bonus - gap_penalty
+                - start_penalty
+        }
+        FuzzyWordMatchKind::Typo => {
+            let typo_penalty = matched.cost as f64 * 130.0;
+            let span_penalty = matched.span_len.abs_diff(word.chars().count()) as f64 * 60.0;
+            560.0 + word_len * 32.0 + prefix_bonus + boundary_bonus - typo_penalty
+                - span_penalty
+                - start_penalty
+        }
+    }
+}
+
+fn is_match_boundary(text: &str, start: usize) -> bool {
+    if start == 0 {
+        return true;
+    }
+
+    text[..start]
+        .chars()
+        .next_back()
+        .map(is_match_separator)
+        .unwrap_or(true)
 }
 
 fn typo_match_word(word: &str, text: &str) -> Option<TypoWordMatch> {
@@ -3388,10 +3657,14 @@ fn run_bench_responsiveness() -> io::Result<()> {
     let (search_tx, search_rx) = spawn_search_worker(SearchScope::Recent);
     let queries = env::var("FFP_BENCH_QUERIES").unwrap_or_else(|_| "m,ma,mai,main,doc,rs".into());
     eprintln!("\n=== Key -> search worker result ===");
-    let mut id = 0u64;
     let mut samples = Vec::new();
-    for query in queries.split(',').map(str::trim).filter(|q| !q.is_empty()) {
-        id += 1;
+    for (index, query) in queries
+        .split(',')
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .enumerate()
+    {
+        let id = index as u64 + 1;
         let start = Instant::now();
         let _ = search_tx.send(SearchRequest {
             id,
@@ -3627,6 +3900,55 @@ mod tests {
         let matches = fuzzy_match("rs", &files, 10);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].index, 0);
+    }
+
+    #[test]
+    fn fuzzy_match_supports_short_exact_and_subsequence_queries() {
+        let files = vec![
+            FileEntry::new("notes.txt".to_string()),
+            FileEntry::new("main.rs".to_string()),
+            FileEntry::new("tmux.conf".to_string()),
+        ];
+
+        let matches = fuzzy_match("m", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "main.rs");
+
+        let matches = fuzzy_match("mr", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "main.rs");
+
+        let matches = fuzzy_match("tmuxconf", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "tmux.conf");
+    }
+
+    #[test]
+    fn fuzzy_match_searches_path_for_single_word_queries() {
+        let files = vec![
+            FileEntry::new("/tmp/other/session-log.txt".to_string()),
+            FileEntry::new("/tmp/jcode/session-log.txt".to_string()),
+        ];
+
+        let matches = fuzzy_match("jcode", &files, 10);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].path, "/tmp/jcode/session-log.txt");
+    }
+
+    #[test]
+    fn fuzzy_match_incremental_rescans_after_broad_short_prefix() {
+        let mut files: Vec<FileEntry> = (0..1500)
+            .map(|i| FileEntry::new(format!("ma-noise-{i}.txt")))
+            .collect();
+        files.push(FileEntry::new("main.rs".to_string()));
+
+        let mut state = MatchSearchState::new(SearchScope::Recent);
+        state.reset_if_stale(SearchScope::Recent, 1, files.len());
+
+        let _ = fuzzy_match_incremental("ma", &files, 10, 64, &mut state);
+        let matches = fuzzy_match_incremental("mai", &files, 10, 64, &mut state);
+        assert!(!matches.is_empty());
+        assert_eq!(files[matches[0].index].name, "main.rs");
     }
 
     #[test]
