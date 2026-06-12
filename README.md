@@ -31,33 +31,39 @@ Linux usually uses `relatime`, so filesystem `atime` may update at most daily fo
 
 ## Performance
 
-Profiled on 20,000 recent files:
+File metadata is gathered on a parallel stat-worker pool, fuzzy scoring fans
+out across CPU cores for large pools, and the startup full-tree scan also
+fills the Ctrl+Z all-files pool so the toggle is instant.
+
+Profiled on 20,000 recent files (and 600,000 all-files entries):
 
 | Operation | Time |
 |-----------|------|
-| File loading | ~2.7s background load |
+| Recent pool load | ~0.9s background load |
 | Empty query match | ~2µs |
-| Fuzzy search | ~2-3ms |
-| Image thumbnail (cold) | 10-20ms |
-| Image thumbnail (cached) | ~10-15µs |
+| Fuzzy search (20k recent pool) | ~0.5-3ms |
+| Fuzzy search (600k all pool) | ~20-30ms |
+| Image thumbnail (cold) | 15-25ms |
+| Image thumbnail (cached) | ~1-2µs |
 
 ### Detailed Profiling
 
 ```
-profile: loaded 20000 files in 2.716906457s
-profile: query <empty> -> 50 matches in 2.205µs
-profile: query "rs" -> 50 matches in 3.154651ms
-profile: query "main" -> 50 matches in 2.768032ms
-profile: query "doc" -> 50 matches in 2.301986ms
+profile: loaded 20000 files in 914.291389ms
+profile: query <empty> -> 50 matches in 1.482µs
+profile: query "rs" -> 50 matches in 1.16141ms
+profile: query "main" -> 50 matches in 2.627592ms
+profile: query "doc" -> 50 matches in 2.743233ms
 
-=== Image Loading Profile ===
-profile: image "38_gray.png" -> 38x38 thumb in 2.7ms
-profile: image "icon-128.png" -> 599x600 thumb in 21.7ms
-profile: image "jcode-vs-claude-code.png" -> 800x562 thumb in 57.4ms
+=== Incremental Typing Profile ===
+profile: incremental query "m" -> 50 matches in 498µs
+profile: incremental query "ma" -> 50 matches in 1.13ms
+profile: incremental query "mai" -> 50 matches in 1.34ms
+profile: incremental query "main" -> 50 matches in 542µs
 
 === Cached Image Access ===
-profile: cold load in 135µs
-profile: hot cache access in 14µs
+profile: cold load in 17.9ms
+profile: hot cache access in 1.6µs
 ```
 
 ## Usage
@@ -67,6 +73,7 @@ ffp              # Launch file picker
 ffp --dir        # Launch directory picker
 ffp --profile    # Run performance profiler
 ffp --bench-responsiveness  # Benchmark input/search/preview responsiveness
+FFP_BENCH_SYNTHETIC=600000 ffp --bench-responsiveness  # Benchmark at all-files scale
 ffp --trace-responsive      # Log slow input/render events to ~/.local/state/ffp/responsiveness.log
 ```
 

@@ -504,6 +504,9 @@ struct App {
     search_rx: mpsc::Receiver<SearchResult>,
     next_search_id: u64,
     latest_search_id: u64,
+    /// Search id of the most recently accepted result, used to detect when a
+    /// search is still in flight so the event loop can poll faster.
+    last_result_search_id: u64,
     selected: usize,
     active_column: usize, // 0 = ranked, 1 = recent
     recent_loading: Arc<Mutex<bool>>,
@@ -599,6 +602,7 @@ impl App {
             search_rx,
             next_search_id: 0,
             latest_search_id: 0,
+            last_result_search_id: 0,
             selected: 0,
             active_column: 0,
             recent_loading,
@@ -940,6 +944,7 @@ impl App {
             self.matches = result.matches;
             self.matches_by_time = result.matches_by_time;
             self.matches_files = result.files;
+            self.last_result_search_id = result.id;
             if self.selected >= self.matches.len() {
                 self.selected = self.matches.len().saturating_sub(1);
             }
@@ -998,6 +1003,12 @@ impl App {
 
     fn is_loading(&self) -> bool {
         *self.loading_for_scope(self.active_scope()).lock().unwrap()
+    }
+
+    /// True while the search worker still owes us a result for the latest
+    /// request, meaning fresh matches could arrive any moment.
+    fn search_pending(&self) -> bool {
+        self.last_result_search_id != self.latest_search_id
     }
 }
 
@@ -6374,11 +6385,14 @@ fn main() -> io::Result<()> {
             );
         }
 
-        // Poll with shorter timeout for smooth video, longer for static content
+        // Poll with shorter timeout for smooth video, longer for static content.
+        // While a search is computing, poll fast so its results render the
+        // moment they arrive instead of waiting out a long poll.
         let poll_ms = match &app.preview_content {
             PreviewContent::Video(_) => 16, // ~60fps
             PreviewContent::VideoStreaming(_) => 16,
             PreviewContent::VideoLoading => 50,
+            _ if app.search_pending() => 8,
             _ => 100,
         };
         let poll_start = Instant::now();
