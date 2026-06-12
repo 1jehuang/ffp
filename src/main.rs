@@ -2259,7 +2259,7 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
             if img.is_raw_rgb {
                 write!(
                     out,
-                    "\x1b_Ga=T,q=2,i=1,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
+                    "\x1b_Ga=T,q=2,i=1,C=1,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
                     img.width,
                     img.height,
                     cols,
@@ -2270,7 +2270,7 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
             } else {
                 write!(
                     out,
-                    "\x1b_Ga=T,q=2,i=1,f=100,c={},r={},m={};{}\x1b\\",
+                    "\x1b_Ga=T,q=2,i=1,C=1,f=100,c={},r={},m={};{}\x1b\\",
                     cols,
                     rows,
                     if is_last { 0 } else { 1 },
@@ -2292,26 +2292,42 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
 
 /// Render image using kitty graphics protocol.
 ///
-/// Writes the kitty image escape sequence directly to stdout without
-/// toggling cursor visibility.  The cursor stays visible at the input
-/// field throughout — no hide/show cycle means no cursor flicker.
+/// Composes one atomic buffer: hide cursor, draw the image, move the
+/// cursor back to the input field, show it again, then a single
+/// write_all + flush. The cursor-move into the preview area therefore
+/// always happens while the cursor is hidden, and visibility is only
+/// restored after the cursor is back at the input field.
 ///
-/// This works because:
-/// - The kitty `a=T` (transmit+display) with `i=1` replaces the
-///   previous image atomically in the terminal.
-/// - The cursor position after the kitty write is irrelevant — we
-///   don't move the cursor, so it stays where ratatui put it (the
-///   input field).  Actually we DO move it (the CUP before the image
-///   data), but ratatui will reposition it on the next draw().
-///
-/// We still buffer everything into a single write_all to avoid
-/// partial display of a half-transmitted image.
-fn render_kitty_image(img: &CachedImage, area: Rect, _cursor_pos: (u16, u16)) -> io::Result<()> {
-    let mut buf: Vec<u8> = Vec::with_capacity(img.data.len() * 2);
-    render_kitty_image_to(img, area, &mut buf)?;
+/// Without this, the visible block cursor jumps into the preview area on
+/// every video frame and sits there until the next ratatui draw
+/// repositions it, which shows up as a flickering block over the video.
+fn render_kitty_image(img: &CachedImage, area: Rect, cursor_pos: (u16, u16)) -> io::Result<()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(img.data.len() * 2 + 32);
+    compose_kitty_render(img, area, cursor_pos, &mut buf)?;
     let mut out = io::stdout().lock();
     out.write_all(&buf)?;
     out.flush()?;
+    Ok(())
+}
+
+/// Build the full atomic render sequence for one frame:
+/// `hide cursor` + `kitty image` + `cursor back to input` + `show cursor`.
+/// Everything must land in one buffer so a terminal can never paint an
+/// intermediate state with a visible cursor inside the preview area.
+fn compose_kitty_render(
+    img: &CachedImage,
+    area: Rect,
+    cursor_pos: (u16, u16),
+    out: &mut impl Write,
+) -> io::Result<()> {
+    write!(out, "\x1b[?25l")?;
+    render_kitty_image_to(img, area, out)?;
+    write!(
+        out,
+        "\x1b[{};{}H\x1b[?25h",
+        cursor_pos.1 + 1,
+        cursor_pos.0 + 1
+    )?;
     Ok(())
 }
 
@@ -4659,6 +4675,82 @@ mod tests {
         );
     }
 
+    /// The single composed frame buffer must be: hide cursor, kitty image,
+    /// cursor reposition to input, show cursor — in exactly that order, so
+    /// the cursor can never be painted inside the preview area.
+    #[test]
+    fn compose_kitty_render_is_atomic_hide_draw_restore() {
+        let img = CachedImage {
+            data: Arc::new(vec![0u8; 64]),
+            width: 16,
+            height: 16,
+            is_raw_rgb: false,
+        };
+        let area = Rect {
+            x: 60,
+            y: 2,
+            width: 40,
+            height: 20,
+        };
+        let cursor_pos = (15u16, 1u16);
+
+        let mut buf = Vec::new();
+        compose_kitty_render(&img, area, cursor_pos, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf).to_string();
+
+        let hide = output.find("\x1b[?25l").expect("must hide cursor first");
+        let kitty = output.find("\x1b_G").expect("must contain kitty payload");
+        let restore = output
+            .find(&format!("\x1b[{};{}H\x1b[?25h", cursor_pos.1 + 1, cursor_pos.0 + 1))
+            .expect("must move cursor back to input before showing it");
+        let show = output.rfind("\x1b[?25h").unwrap();
+
+        assert!(hide < kitty, "hide must precede the kitty image");
+        assert!(kitty < restore, "reposition must follow the kitty image");
+        assert_eq!(
+            output.matches("\x1b[?25h").count(),
+            1,
+            "exactly one cursor show"
+        );
+        assert_eq!(
+            output.matches("\x1b[?25l").count(),
+            1,
+            "exactly one cursor hide"
+        );
+        assert!(
+            output.ends_with("\x1b[?25h"),
+            "buffer must end with the cursor visible at the input field"
+        );
+        assert!(show > kitty);
+    }
+
+    /// `C=1` tells kitty not to move the cursor after drawing the image, so
+    /// even the hidden cursor never travels with the graphics payload.
+    #[test]
+    fn kitty_image_does_not_move_cursor() {
+        let img = CachedImage {
+            data: Arc::new(vec![0u8; 32]),
+            width: 8,
+            height: 8,
+            is_raw_rgb: true,
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 5,
+        };
+        let mut buf = Vec::new();
+        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+        let cmds = parse_kitty_commands(&output);
+        assert!(!cmds.is_empty());
+        assert!(
+            get_kitty_header(&cmds[0]).contains("C=1"),
+            "kitty image must use C=1 (do not move cursor)"
+        );
+    }
+
     #[test]
     fn kitty_render_no_cursor_toggle() {
         let img = CachedImage {
@@ -5134,7 +5226,7 @@ mod tests {
             ) {
                 if let Some(frame) = frames.get(idx) {
                     let mut buf: Vec<u8> = Vec::new();
-                    render_kitty_image_to(frame, area, &mut buf).unwrap();
+                    compose_kitty_render(frame, area, cursor_input, &mut buf).unwrap();
                     terminal_bytes.extend_from_slice(&buf);
                 }
                 last_rendered_path = preview_path.to_string();
@@ -5151,12 +5243,14 @@ mod tests {
             let last_show = before.rfind("\x1b[?25h");
             let last_hide = before.rfind("\x1b[?25l");
 
-            if let (Some(show_pos), Some(hide_pos)) = (last_show, last_hide) {
-                // This simulation primarily asserts that kitty frames render and
-                // the cursor is eventually restored. Keep this diagnostic value
-                // available for debugging cursor-order regressions without
-                // failing on terminal-sequence interleavings that are valid.
-                let _cursor_was_shown_after_last_hide = show_pos > hide_pos;
+            // Every kitty write must happen while the cursor is hidden:
+            // the most recent visibility change before it must be a hide.
+            let hide_pos = last_hide.expect("kitty write without a preceding cursor hide");
+            if let Some(show_pos) = last_show {
+                assert!(
+                    hide_pos > show_pos,
+                    "cursor was visible when a kitty frame was written"
+                );
             }
         }
 
@@ -5899,14 +5993,7 @@ fn run_bench_flicker() -> io::Result<()> {
             ) {
                 if let Some(frame) = frames.get(idx) {
                     let mut buf: Vec<u8> = Vec::with_capacity(frame.data.len() * 2);
-                    write!(buf, "\x1b[?25l")?;
-                    render_kitty_image_to(frame, area, &mut buf)?;
-                    write!(
-                        buf,
-                        "\x1b[{};{}H\x1b[?25h",
-                        cursor_input.1 + 1,
-                        cursor_input.0 + 1
-                    )?;
+                    compose_kitty_render(frame, area, cursor_input, &mut buf)?;
                     recorder.write_all(&buf)?;
                     recorder.flush()?;
                 }
