@@ -16,6 +16,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{HashMap, HashSet},
     env, fs,
@@ -43,7 +44,8 @@ const MATCH_QUERY_CACHE_SIZE: usize = 32;
 const INCREMENTAL_QUERY_MIN_CHARS: usize = 3;
 const INCREMENTAL_ACCEPT_MIN_MATCHES: usize = 8;
 const FILE_BATCH_SIZE: usize = 256;
-const ENTRY_SNAPSHOT_PUBLISH_INTERVAL: usize = 20_000;
+const ENTRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
+const STAT_WORKER_MAX: usize = 8;
 const FILE_LOOKBACK_WINDOW: &str = "9d";
 const FILE_LOOKBACK_WINDOW_SECS: u64 = 9 * 24 * 60 * 60;
 const RECENT_POOL_LIMIT: usize = 20_000;
@@ -199,11 +201,13 @@ fn unix_time_ms() -> u128 {
 
 #[derive(Clone)]
 struct FileEntry {
-    path: String,
-    path_lower: String,
-    name: String,
-    name_lower: String,
-    dir: String,
+    /// Shared so snapshot publishes clone refcounts instead of string data.
+    path: Arc<str>,
+    path_lower: Arc<str>,
+    /// Byte offset of the basename within `path`.
+    name_start: u32,
+    /// Byte offset of the basename within `path_lower`.
+    lower_name_start: u32,
     mtime: SystemTime,
     recency_time: SystemTime,
     recency_source: RecencySource,
@@ -245,8 +249,24 @@ impl RecencyIndex {
         }
     }
 
-    fn path_key(&self, path: &str) -> String {
-        normalized_path_key_with_cwd(path, &self.cwd)
+    fn path_key<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        if path_is_normalized_absolute(path) {
+            return Cow::Borrowed(path);
+        }
+        Cow::Owned(normalized_path_key_with_cwd(path, &self.cwd))
+    }
+
+    /// Look up history/desktop recency for a path without allocating in the
+    /// common case where the recency maps are small or empty.
+    fn recency_times(&self, path: &str) -> (Option<SystemTime>, Option<SystemTime>) {
+        if self.ffp_history.is_empty() && self.desktop_recent.is_empty() {
+            return (None, None);
+        }
+        let key = self.path_key(path);
+        (
+            self.ffp_history.get(key.as_ref()).copied(),
+            self.desktop_recent.get(key.as_ref()).copied(),
+        )
     }
 
     fn candidate_paths(&self) -> Vec<String> {
@@ -305,6 +325,20 @@ fn normalized_path_key(path: &str) -> String {
     normalized_path_key_with_cwd(path, &cwd)
 }
 
+/// True when a path is absolute and contains no `.`/`..` components or
+/// trailing/duplicate separators, i.e. it is already its own normalized key.
+fn path_is_normalized_absolute(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    if !path.starts_with('/') || path.ends_with('/') {
+        return false;
+    }
+    !path[1..]
+        .split('/')
+        .any(|component| component.is_empty() || component == "." || component == "..")
+}
+
 fn normalized_path_key_with_cwd(path: &str, cwd: &Path) -> String {
     let path = Path::new(path);
     let absolute = if path.is_absolute() {
@@ -352,8 +386,10 @@ struct SearchResult {
     id: u64,
     query: String,
     scope: SearchScope,
-    file_version: u64,
-    file_count: usize,
+    /// The exact snapshot the matches were computed against. Renderers must
+    /// resolve match indexes against this snapshot (never against a newer
+    /// pool) so results can never point at the wrong files.
+    files: EntrySnapshot,
     matches: Vec<MatchEntry>,
     matches_by_time: Vec<MatchEntry>,
 }
@@ -457,6 +493,10 @@ struct App {
     dir_version: Arc<AtomicU64>,
     matches: Vec<MatchEntry>,
     matches_by_time: Vec<MatchEntry>,
+    /// Snapshot the current matches index into. Kept in lockstep with
+    /// `matches`/`matches_by_time` so scope toggles can never render stale
+    /// indexes against a different file pool.
+    matches_files: EntrySnapshot,
     search_tx: mpsc::Sender<SearchRequest>,
     search_rx: mpsc::Receiver<SearchResult>,
     next_search_id: u64,
@@ -517,8 +557,12 @@ impl App {
                 dir_mode,
                 false,
                 Arc::clone(&recency_index),
+                None,
             );
         } else {
+            // The recent loader's final full-tree pass also feeds the
+            // all-files pool, so Ctrl+Z is instant instead of starting a
+            // second multi-second scan.
             spawn_entry_loader(
                 Arc::clone(&recent_files),
                 Arc::clone(&recent_loading),
@@ -526,6 +570,11 @@ impl App {
                 dir_mode,
                 true,
                 Arc::clone(&recency_index),
+                Some(AllPoolSink {
+                    files: Arc::clone(&all_files),
+                    loading: Arc::clone(&all_loading),
+                    version: Arc::clone(&all_version),
+                }),
             );
         }
 
@@ -542,6 +591,7 @@ impl App {
             dir_version,
             matches: Vec::new(),
             matches_by_time: Vec::new(),
+            matches_files: Arc::new(Vec::new()),
             search_tx,
             search_rx,
             next_search_id: 0,
@@ -630,21 +680,23 @@ impl App {
         self.search_scope = self.search_scope.toggle();
         self.selected = 0;
         self.preview_path.clear();
+        // Keep the current matches visible until the new scope's results
+        // arrive; they stay correct because they render against the snapshot
+        // they were computed from. Force a re-search immediately.
         self.last_file_version = u64::MAX;
 
         if self.search_scope == SearchScope::All {
-            let needs_load = self.all_files.lock().unwrap().is_empty();
-            let is_loading = *self.all_loading.lock().unwrap();
-            if needs_load && !is_loading {
-                spawn_entry_loader(
-                    Arc::clone(&self.all_files),
-                    Arc::clone(&self.all_loading),
-                    Arc::clone(&self.all_version),
-                    self.dir_mode,
-                    false,
-                    Arc::clone(&self.recency_index),
-                );
-            }
+            // No-op when the pool is already loaded or a loader (including
+            // the startup recent loader feeding the all pool) owns it.
+            spawn_entry_loader(
+                Arc::clone(&self.all_files),
+                Arc::clone(&self.all_loading),
+                Arc::clone(&self.all_version),
+                self.dir_mode,
+                false,
+                Arc::clone(&self.recency_index),
+                None,
+            );
         }
     }
 
@@ -653,41 +705,46 @@ impl App {
         self.selected = 0;
         self.preview_path.clear();
         self.preview_content = PreviewContent::None;
+        self.clear_matches();
         self.last_query.clear();
         self.last_file_count = 0;
         self.last_file_version = u64::MAX;
 
         if self.dir_mode {
-            let needs_load = self.dir_entries.lock().unwrap().is_empty();
-            let is_loading = *self.dir_loading.lock().unwrap();
-            if needs_load && !is_loading {
-                spawn_entry_loader(
-                    Arc::clone(&self.dir_entries),
-                    Arc::clone(&self.dir_loading),
-                    Arc::clone(&self.dir_version),
-                    true,
-                    false,
-                    Arc::clone(&self.recency_index),
-                );
-            }
+            spawn_entry_loader(
+                Arc::clone(&self.dir_entries),
+                Arc::clone(&self.dir_loading),
+                Arc::clone(&self.dir_version),
+                true,
+                false,
+                Arc::clone(&self.recency_index),
+                None,
+            );
         } else {
             let scope = self.search_scope;
-            let files = self.files_for_scope(scope);
-            let loading = self.loading_for_scope(scope);
-            let needs_load = files.lock().unwrap().is_empty();
-            let is_loading = *loading.lock().unwrap();
-
-            if needs_load && !is_loading {
-                spawn_entry_loader(
-                    Arc::clone(files),
-                    Arc::clone(loading),
-                    Arc::clone(self.version_for_scope(scope)),
-                    false,
-                    scope == SearchScope::Recent,
-                    Arc::clone(&self.recency_index),
-                );
-            }
+            let all_sink = (scope == SearchScope::Recent).then(|| AllPoolSink {
+                files: Arc::clone(&self.all_files),
+                loading: Arc::clone(&self.all_loading),
+                version: Arc::clone(&self.all_version),
+            });
+            spawn_entry_loader(
+                Arc::clone(self.files_for_scope(scope)),
+                Arc::clone(self.loading_for_scope(scope)),
+                Arc::clone(self.version_for_scope(scope)),
+                false,
+                scope == SearchScope::Recent,
+                Arc::clone(&self.recency_index),
+                all_sink,
+            );
         }
+    }
+
+    /// Drop all current matches together with their snapshot so the UI never
+    /// renders indexes from one file pool against another.
+    fn clear_matches(&mut self) {
+        self.matches.clear();
+        self.matches_by_time.clear();
+        self.matches_files = Arc::new(Vec::new());
     }
 
     fn loading_preview(message: &'static str) -> PreviewContent {
@@ -865,23 +922,21 @@ impl App {
 
     fn update_matches(&mut self) {
         while let Ok(result) = self.search_rx.try_recv() {
+            // Accept only the newest request's result for the current
+            // query/scope. The result may have been computed against a
+            // slightly older snapshot while a loader is still publishing;
+            // that is fine because the snapshot travels with the result and
+            // a follow-up search for the newer snapshot is already queued.
             if result.id != self.latest_search_id
                 || result.query != self.query
                 || result.scope != self.active_scope()
-                || result.file_version
-                    != self
-                        .version_for_scope(result.scope)
-                        .load(AtomicOrdering::Relaxed)
             {
                 continue;
             }
 
             self.matches = result.matches;
             self.matches_by_time = result.matches_by_time;
-            self.last_query = result.query;
-            self.last_file_count = result.file_count;
-            self.last_file_version = result.file_version;
-            self.last_scope = result.scope;
+            self.matches_files = result.files;
             if self.selected >= self.matches.len() {
                 self.selected = self.matches.len().saturating_sub(1);
             }
@@ -919,7 +974,6 @@ impl App {
     }
 
     fn selected_file(&self) -> Option<String> {
-        let files = self.snapshot_for_scope(self.active_scope());
         let matches = if self.active_column == 0 {
             &self.matches
         } else {
@@ -927,8 +981,8 @@ impl App {
         };
         matches
             .get(self.selected)
-            .and_then(|m| files.get(m.index))
-            .map(|entry| entry.path.clone())
+            .and_then(|m| self.matches_files.get(m.index))
+            .map(|entry| entry.path.to_string())
     }
 
     fn active_matches(&self) -> &[MatchEntry] {
@@ -1297,6 +1351,14 @@ fn build_fd_args(dir_mode: bool, recent_only: bool) -> Vec<String> {
     args
 }
 
+/// Destination for the full file pool when a recent-scope load is already
+/// walking the whole tree anyway. Lets one fd scan fill both pools.
+struct AllPoolSink {
+    files: SharedEntries,
+    loading: Arc<Mutex<bool>>,
+    version: Arc<AtomicU64>,
+}
+
 fn spawn_entry_loader(
     files: SharedEntries,
     loading: Arc<Mutex<bool>>,
@@ -1304,8 +1366,15 @@ fn spawn_entry_loader(
     dir_mode: bool,
     recent_only: bool,
     recency_index: Arc<RecencyIndex>,
+    all_sink: Option<AllPoolSink>,
 ) {
-    *loading.lock().unwrap() = true;
+    if !try_begin_load(&loading, &files) {
+        return;
+    }
+    // Claim the all pool up front so a Ctrl+Z during the recent scan reuses
+    // this scan instead of kicking off a second full-tree walk.
+    let all_sink =
+        all_sink.filter(|sink| !dir_mode && recent_only && try_begin_load(&sink.loading, &sink.files));
     publish_entries(&files, &[], &version);
 
     thread::spawn(move || {
@@ -1316,8 +1385,21 @@ fn spawn_entry_loader(
             dir_mode,
             recent_only,
             recency_index,
+            all_sink,
         );
     });
+}
+
+/// Atomically claim the loader for a scope. Returns false when entries are
+/// already loaded or another loader is running, so concurrent toggles can
+/// never spawn duplicate scans.
+fn try_begin_load(loading: &Arc<Mutex<bool>>, files: &SharedEntries) -> bool {
+    let mut loading = loading.lock().unwrap();
+    if *loading || !files.lock().unwrap().is_empty() {
+        return false;
+    }
+    *loading = true;
+    true
 }
 
 fn load_entries(
@@ -1327,9 +1409,11 @@ fn load_entries(
     dir_mode: bool,
     recent_only: bool,
     recency_index: Arc<RecencyIndex>,
+    all_sink: Option<AllPoolSink>,
 ) {
     let mut seen = HashSet::new();
     let mut loaded = Vec::new();
+    let mut last_publish = Instant::now();
 
     if recent_only && !dir_mode {
         // Stage 1: paths we already know were recently opened by ffp or the desktop.
@@ -1337,7 +1421,14 @@ fn load_entries(
         for path in recency_index.candidate_paths() {
             push_entry_if_wanted(path, &mut buffer, &mut seen, &recency_index, true);
         }
-        flush_entry_buffer(&files, &mut loaded, &mut buffer, &version, true);
+        flush_entry_buffer(
+            &files,
+            &mut loaded,
+            &mut buffer,
+            &version,
+            true,
+            &mut last_publish,
+        );
         sort_loaded_entries(&files, &mut loaded, &version, true);
 
         // Stage 2: the old fast path, modified recently according to fd.
@@ -1349,11 +1440,18 @@ fn load_entries(
             &mut seen,
             &mut loaded,
             true,
+            true,
+            &mut last_publish,
+            None,
         );
         sort_loaded_entries(&files, &mut loaded, &version, true);
 
         // Stage 3: broader background pass for access-time recency. This can take
         // longer on large homes, but the UI is already usable from stages 1 and 2.
+        // fd never emits duplicate paths within one run, so this stage only
+        // checks `seen` without growing it. When an all-pool sink is attached
+        // this same scan also fills the Ctrl+Z all-files pool.
+        let mut all_loaded = Vec::new();
         load_fd_entries(
             build_fd_args(false, false),
             &files,
@@ -1362,7 +1460,14 @@ fn load_entries(
             &mut seen,
             &mut loaded,
             true,
+            false,
+            &mut last_publish,
+            all_sink.as_ref().map(|sink| (sink, &mut all_loaded)),
         );
+        if let Some(sink) = all_sink {
+            sort_loaded_entries(&sink.files, &mut all_loaded, &sink.version, false);
+            *sink.loading.lock().unwrap() = false;
+        }
     } else {
         load_fd_entries(
             build_fd_args(dir_mode, false),
@@ -1372,6 +1477,9 @@ fn load_entries(
             &mut seen,
             &mut loaded,
             false,
+            false,
+            &mut last_publish,
+            None,
         );
     }
 
@@ -1384,43 +1492,107 @@ fn load_fd_entries(
     args: Vec<String>,
     files: &SharedEntries,
     version: &AtomicU64,
-    recency_index: &RecencyIndex,
+    recency_index: &Arc<RecencyIndex>,
     seen: &mut HashSet<String>,
     loaded: &mut Vec<FileEntry>,
     recent_only: bool,
+    record_seen: bool,
+    last_publish: &mut Instant,
+    mut all_out: Option<(&AllPoolSink, &mut Vec<FileEntry>)>,
 ) {
-    let child = Command::new("fd")
+    let mut child = match Command::new("fd")
         .args(&args)
         .stdout(Stdio::piped())
-        .spawn();
-
-    if let Ok(mut child) = child {
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            let mut buffer = Vec::new();
-
-            for read_result in reader.split(b'\n') {
-                let line = match read_result {
-                    Ok(line) => line,
-                    Err(_) => break,
-                };
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                let path = String::from_utf8_lossy(&line).to_string();
-                push_entry_if_wanted(path, &mut buffer, seen, recency_index, recent_only);
-
-                if buffer.len() >= FILE_BATCH_SIZE {
-                    flush_entry_buffer(files, loaded, &mut buffer, version, recent_only);
-                }
-            }
-
-            flush_entry_buffer(files, loaded, &mut buffer, version, recent_only);
-        }
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    let Some(stdout) = child.stdout.take() else {
         let _ = child.wait();
+        return;
+    };
+
+    // Metadata lookups dominate scan time, so fan paths out to a small pool
+    // of stat workers and collect finished entries on this thread.
+    let (path_tx, path_rx) = mpsc::channel::<String>();
+    let path_rx = Arc::new(Mutex::new(path_rx));
+    let (entry_tx, entry_rx) = mpsc::channel::<FileEntry>();
+
+    let reader = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for read_result in reader.split(b'\n') {
+            let Ok(line) = read_result else { break };
+            if line.is_empty() {
+                continue;
+            }
+            let path = String::from_utf8_lossy(&line).to_string();
+            if path_tx.send(path).is_err() {
+                break;
+            }
+        }
+    });
+
+    let worker_count = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, STAT_WORKER_MAX);
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let path_rx = Arc::clone(&path_rx);
+        let entry_tx = entry_tx.clone();
+        let recency_index = Arc::clone(recency_index);
+        workers.push(thread::spawn(move || loop {
+            let received = { path_rx.lock().unwrap().recv() };
+            let Ok(path) = received else { break };
+            let Some(entry) = FileEntry::try_new_with_recency(path, &recency_index) else {
+                continue;
+            };
+            if entry_tx.send(entry).is_err() {
+                break;
+            }
+        }));
     }
+    drop(entry_tx);
+
+    let mut buffer = Vec::new();
+    let mut all_last_publish = Instant::now();
+    while let Ok(entry) = entry_rx.recv() {
+        if let Some((sink, all_loaded)) = all_out.as_mut() {
+            // The all pool takes every scanned entry, before any recency
+            // filtering. Entry clones are cheap (shared path strings).
+            all_loaded.push(entry.clone());
+            if all_last_publish.elapsed() >= ENTRY_PUBLISH_INTERVAL {
+                publish_entries(&sink.files, all_loaded, &sink.version);
+                all_last_publish = Instant::now();
+            }
+        }
+
+        if recent_only && !is_within_recent_window(entry.recency_time) {
+            continue;
+        }
+        if !seen.is_empty() || record_seen {
+            let key = recency_index.path_key(&entry.path);
+            if seen.contains(key.as_ref()) {
+                continue;
+            }
+            if record_seen {
+                seen.insert(key.into_owned());
+            }
+        }
+        buffer.push(entry);
+
+        if buffer.len() >= FILE_BATCH_SIZE {
+            flush_entry_buffer(files, loaded, &mut buffer, version, recent_only, last_publish);
+        }
+    }
+    flush_entry_buffer(files, loaded, &mut buffer, version, recent_only, last_publish);
+
+    for worker in workers {
+        let _ = worker.join();
+    }
+    let _ = reader.join();
+    let _ = child.wait();
 }
 
 fn push_entry_if_wanted(
@@ -1431,9 +1603,10 @@ fn push_entry_if_wanted(
     recent_only: bool,
 ) {
     let key = recency_index.path_key(&path);
-    if seen.contains(&key) {
+    if seen.contains(key.as_ref()) {
         return;
     }
+    let key = key.into_owned();
 
     let Some(entry) = FileEntry::try_new_with_recency(path, recency_index) else {
         return;
@@ -1453,16 +1626,21 @@ fn flush_entry_buffer(
     buffer: &mut Vec<FileEntry>,
     version: &AtomicU64,
     cap_recent_pool: bool,
+    last_publish: &mut Instant,
 ) {
-    if !buffer.is_empty() {
-        loaded.append(buffer);
-        if cap_recent_pool && loaded.len() >= RECENT_POOL_LIMIT * 2 {
-            loaded.sort_by(compare_entries_by_recency);
-            loaded.truncate(RECENT_POOL_LIMIT);
-            publish_entries(files, loaded, version);
-        } else if loaded.len() % ENTRY_SNAPSHOT_PUBLISH_INTERVAL < FILE_BATCH_SIZE {
-            publish_entries(files, loaded, version);
-        }
+    if buffer.is_empty() {
+        return;
+    }
+
+    loaded.append(buffer);
+    if cap_recent_pool && loaded.len() >= RECENT_POOL_LIMIT * 2 {
+        loaded.sort_by(compare_entries_by_recency);
+        loaded.truncate(RECENT_POOL_LIMIT);
+        publish_entries(files, loaded, version);
+        *last_publish = Instant::now();
+    } else if last_publish.elapsed() >= ENTRY_PUBLISH_INTERVAL {
+        publish_entries(files, loaded, version);
+        *last_publish = Instant::now();
     }
 }
 
@@ -1492,7 +1670,7 @@ fn compare_entries_by_recency(a: &FileEntry, b: &FileEntry) -> Ordering {
     b.recency_time
         .cmp(&a.recency_time)
         .then_with(|| b.mtime.cmp(&a.mtime))
-        .then_with(|| a.name_lower.cmp(&b.name_lower))
+        .then_with(|| a.name_lower().cmp(&b.name_lower()))
 }
 
 fn load_files(files: SharedEntries, loading: Arc<Mutex<bool>>) {
@@ -1503,24 +1681,33 @@ fn load_files(files: SharedEntries, loading: Arc<Mutex<bool>>) {
         false,
         true,
         Arc::new(RecencyIndex::load()),
+        None,
     );
 }
 
-fn basename(path: &str) -> &str {
-    Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(path)
-}
-
-fn dirname(path: &str) -> &str {
-    Path::new(path)
-        .parent()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
+/// Byte offset where the basename begins. fd output never has trailing
+/// slashes, so the basename is everything after the last separator.
+fn basename_start(path: &str) -> usize {
+    path.rfind('/').map(|i| i + 1).unwrap_or(0)
 }
 
 impl FileEntry {
+    fn name(&self) -> &str {
+        &self.path[self.name_start as usize..]
+    }
+
+    fn name_lower(&self) -> &str {
+        &self.path_lower[self.lower_name_start as usize..]
+    }
+
+    fn dir(&self) -> &str {
+        let name_start = self.name_start as usize;
+        if name_start <= 1 {
+            return &self.path[..name_start];
+        }
+        &self.path[..name_start - 1]
+    }
+
     #[cfg(test)]
     fn new(path: String) -> Self {
         Self::new_with_recency(path, &RecencyIndex::default())
@@ -1542,10 +1729,13 @@ impl FileEntry {
         metadata: Option<&fs::Metadata>,
         recency_index: &RecencyIndex,
     ) -> Self {
-        let name = basename(&path).to_string();
-        let dir = dirname(&path).to_string();
-        let name_lower = name.to_lowercase();
-        let path_lower = path.to_lowercase();
+        let name_start = basename_start(&path);
+        // Lowercase the directory part and basename separately so the
+        // basename boundary stays known even when lowercasing changes byte
+        // lengths (e.g. "İ" -> "i̇").
+        let mut path_lower = path[..name_start].to_lowercase();
+        let lower_name_start = path_lower.len();
+        path_lower.push_str(&path[name_start..].to_lowercase());
         let is_dir = metadata.map(|m| m.is_dir()).unwrap_or(false);
         let mtime = metadata
             .and_then(|m| m.modified().ok())
@@ -1553,17 +1743,14 @@ impl FileEntry {
         let atime = metadata
             .and_then(|m| m.accessed().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let key = recency_index.path_key(&path);
-        let history_time = recency_index.ffp_history.get(&key).copied();
-        let desktop_time = recency_index.desktop_recent.get(&key).copied();
+        let (history_time, desktop_time) = recency_index.recency_times(&path);
         let (recency_time, recency_source) = best_recency(mtime, atime, history_time, desktop_time);
 
         Self {
-            path,
-            path_lower,
-            name,
-            name_lower,
-            dir,
+            path: path.into(),
+            path_lower: path_lower.into(),
+            name_start: name_start as u32,
+            lower_name_start: lower_name_start as u32,
             mtime,
             recency_time,
             recency_source,
@@ -2234,8 +2421,7 @@ fn spawn_search_worker(
                     id: request.id,
                     query: request.query,
                     scope: request.scope,
-                    file_version: request.file_version,
-                    file_count,
+                    files: request.files,
                     matches,
                     matches_by_time,
                 })
@@ -2543,13 +2729,13 @@ fn is_incremental_warm_candidate(
     // Short prefixes often do not score high enough to be visible yet, but they
     // are exactly the state we want to reuse while the user continues typing.
     if query_char_count <= 2 {
-        return chars_in_order(query_compact, &entry.name_lower)
+        return chars_in_order(query_compact, &entry.name_lower())
             || chars_in_order(query_compact, &entry.path_lower);
     }
 
     if query_words.iter().any(|word| {
         word.chars().count() >= 2
-            && (entry.name_lower.contains(word) || entry.path_lower.contains(word))
+            && (entry.name_lower().contains(word) || entry.path_lower.contains(word))
     }) {
         return true;
     }
@@ -2557,7 +2743,7 @@ fn is_incremental_warm_candidate(
     // Keep this bounded to typo-sized prefixes. Long queries should be narrowed
     // by the scored candidate list instead of a broad subsequence filter.
     query_char_count <= 6
-        && (chars_in_order(query_compact, &entry.name_lower)
+        && (chars_in_order(query_compact, &entry.name_lower())
             || chars_in_order(query_compact, &entry.path_lower))
 }
 
@@ -2607,9 +2793,9 @@ fn file_match_score(
         return None;
     }
 
-    let name_score = fuzzy_match_text_score(query_words, &entry.name_lower, 10_000.0, allow_typos);
+    let name_score = fuzzy_match_text_score(query_words, &entry.name_lower(), 10_000.0, allow_typos);
     let path_score = if !include_path
-        || entry.path_lower == entry.name_lower
+        || entry.path_lower.as_ref() == entry.name_lower()
         || !should_score_path(query_lower, query_words, name_score, entry)
     {
         None
@@ -2636,7 +2822,7 @@ fn should_score_path(
 
     let compact_query = query_lower.trim();
     compact_query.len() >= 2
-        && !entry.name_lower.contains(compact_query)
+        && !entry.name_lower().contains(compact_query)
         && entry.path_lower.contains(compact_query)
 }
 
@@ -3418,7 +3604,7 @@ fn run_profile() -> io::Result<()> {
                 Some(img) => {
                     eprintln!(
                         "profile: image {:?} -> {}x{} thumb, {} bytes in {:?}",
-                        file.name,
+                        file.name(),
                         img.width,
                         img.height,
                         img.data.len(),
@@ -3426,7 +3612,7 @@ fn run_profile() -> io::Result<()> {
                     );
                 }
                 None => {
-                    eprintln!("profile: image {:?} -> FAILED in {:?}", file.name, duration);
+                    eprintln!("profile: image {:?} -> FAILED in {:?}", file.name(), duration);
                 }
             }
         }
@@ -3440,8 +3626,8 @@ fn run_profile() -> io::Result<()> {
             let start = Instant::now();
             if let Some(img) = load_thumbnail(&first.path) {
                 let load_time = start.elapsed();
-                cache.insert(first.path.clone(), img);
-                eprintln!("profile: cold load {:?} in {:?}", first.name, load_time);
+                cache.insert(first.path.to_string(), img);
+                eprintln!("profile: cold load {:?} in {:?}", first.name(), load_time);
 
                 // Cached access (hot)
                 let start = Instant::now();
@@ -3449,7 +3635,7 @@ fn run_profile() -> io::Result<()> {
                 let cache_time = start.elapsed();
                 eprintln!(
                     "profile: hot cache access {:?} in {:?}",
-                    first.name, cache_time
+                    first.name(), cache_time
                 );
             }
         }
@@ -3467,7 +3653,7 @@ fn run_profile() -> io::Result<()> {
         eprintln!("No video files found in recent files");
     } else {
         for file in &video_files {
-            eprintln!("\n--- {} ---", file.name);
+            eprintln!("\n--- {} ---", file.name());
 
             // Get video info
             if let Some(dur) = get_video_duration(&file.path) {
@@ -3562,17 +3748,17 @@ fn run_profile() -> io::Result<()> {
             let cold = start.elapsed();
             let frames = Arc::try_unwrap(shared).unwrap().into_inner().unwrap();
             let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
-            vcache.insert(first.path.clone(), frames);
+            vcache.insert(first.path.to_string(), frames);
             eprintln!(
                 "  cold load {:?}: {:?} ({:.1} MiB)",
-                first.name,
+                first.name(),
                 cold,
                 total_bytes as f64 / (1024.0 * 1024.0)
             );
 
             let start = Instant::now();
             let _ = vcache.get(&first.path);
-            eprintln!("  hot cache access {:?}: {:?}", first.name, start.elapsed());
+            eprintln!("  hot cache access {:?}: {:?}", first.name(), start.elapsed());
         }
     }
 
@@ -3727,7 +3913,7 @@ fn run_bench_responsiveness() -> io::Result<()> {
         let _ = load_preview_result_content(&text_file.path, &syntax_set, &theme);
         eprintln!(
             "bench: text_preview {:?}: {:?}",
-            text_file.name,
+            text_file.name(),
             start.elapsed()
         );
     }
@@ -3736,7 +3922,7 @@ fn run_bench_responsiveness() -> io::Result<()> {
         let _ = load_preview_result_content(&image_file.path, &syntax_set, &theme);
         eprintln!(
             "bench: image_preview {:?}: {:?}",
-            image_file.name,
+            image_file.name(),
             start.elapsed()
         );
     }
@@ -3870,15 +4056,15 @@ mod tests {
 
         let matches = fuzzy_match("mian", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "main.rs");
+        assert_eq!(files[matches[0].index].name(), "main.rs");
 
         let matches = fuzzy_match("documnt", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "document.pdf");
+        assert_eq!(files[matches[0].index].name(), "document.pdf");
 
         let matches = fuzzy_match("configg", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "config.toml");
+        assert_eq!(files[matches[0].index].name(), "config.toml");
     }
 
     #[test]
@@ -3890,7 +4076,7 @@ mod tests {
 
         let matches = fuzzy_match("jcode sessino", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].path, "/tmp/jcode/session-log.txt");
+        assert_eq!(files[matches[0].index].path.as_ref(), "/tmp/jcode/session-log.txt");
     }
 
     #[test]
@@ -3912,15 +4098,15 @@ mod tests {
 
         let matches = fuzzy_match("m", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "main.rs");
+        assert_eq!(files[matches[0].index].name(), "main.rs");
 
         let matches = fuzzy_match("mr", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "main.rs");
+        assert_eq!(files[matches[0].index].name(), "main.rs");
 
         let matches = fuzzy_match("tmuxconf", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "tmux.conf");
+        assert_eq!(files[matches[0].index].name(), "tmux.conf");
     }
 
     #[test]
@@ -3932,7 +4118,7 @@ mod tests {
 
         let matches = fuzzy_match("jcode", &files, 10);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].path, "/tmp/jcode/session-log.txt");
+        assert_eq!(files[matches[0].index].path.as_ref(), "/tmp/jcode/session-log.txt");
     }
 
     #[test]
@@ -3948,7 +4134,7 @@ mod tests {
         let _ = fuzzy_match_incremental("ma", &files, 10, 64, &mut state);
         let matches = fuzzy_match_incremental("mai", &files, 10, 64, &mut state);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "main.rs");
+        assert_eq!(files[matches[0].index].name(), "main.rs");
     }
 
     #[test]
@@ -3968,7 +4154,7 @@ mod tests {
 
         let matches = fuzzy_match_incremental("mian", &files, 10, 16, &mut state);
         assert!(!matches.is_empty());
-        assert_eq!(files[matches[0].index].name, "main.rs");
+        assert_eq!(files[matches[0].index].name(), "main.rs");
         assert_eq!(state.last_query, "mian");
     }
 
@@ -3984,7 +4170,7 @@ mod tests {
         let first = fuzzy_match_incremental("documnt", &files, 10, 16, &mut state);
         let second = fuzzy_match_incremental("documnt", &files, 10, 16, &mut state);
         assert_eq!(first.len(), second.len());
-        assert_eq!(files[second[0].index].name, "document.pdf");
+        assert_eq!(files[second[0].index].name(), "document.pdf");
     }
 
     #[test]
@@ -4032,6 +4218,84 @@ mod tests {
     fn history_path_escaping_round_trips() {
         let path = "/tmp/ffp path/with\\slashes\tand\nnewlines.txt";
         assert_eq!(unescape_history_path(&escape_history_path(path)), path);
+    }
+
+    #[test]
+    fn file_entry_name_dir_accessors() {
+        let entry = FileEntry::new("/home/jeremy/Documents/Notes.TXT".to_string());
+        assert_eq!(entry.name(), "Notes.TXT");
+        assert_eq!(entry.name_lower(), "notes.txt");
+        assert_eq!(entry.dir(), "/home/jeremy/Documents");
+        assert_eq!(entry.path_lower.as_ref(), "/home/jeremy/documents/notes.txt");
+
+        let root_file = FileEntry::new("/swapfile".to_string());
+        assert_eq!(root_file.name(), "swapfile");
+        assert_eq!(root_file.dir(), "/");
+
+        let bare = FileEntry::new("README.md".to_string());
+        assert_eq!(bare.name(), "README.md");
+        assert_eq!(bare.dir(), "");
+    }
+
+    #[test]
+    fn file_entry_handles_multibyte_lowercase_boundary() {
+        // 'İ' lowercases to a two-byte sequence, shifting byte offsets.
+        let entry = FileEntry::new("/tmp/İstanbul/İzmir.TXT".to_string());
+        assert_eq!(entry.name(), "İzmir.TXT");
+        assert_eq!(entry.name_lower(), "İzmir.TXT".to_lowercase());
+        assert_eq!(entry.dir(), "/tmp/İstanbul");
+    }
+
+    #[test]
+    fn normalized_absolute_paths_skip_rekeying() {
+        assert!(path_is_normalized_absolute("/home/jeremy/file.txt"));
+        assert!(path_is_normalized_absolute("/"));
+        assert!(!path_is_normalized_absolute("relative/file.txt"));
+        assert!(!path_is_normalized_absolute("/home/./file.txt"));
+        assert!(!path_is_normalized_absolute("/home/../file.txt"));
+        assert!(!path_is_normalized_absolute("/home//file.txt"));
+        assert!(!path_is_normalized_absolute("/home/jeremy/"));
+    }
+
+    #[test]
+    fn path_key_matches_normalized_form() {
+        let index = RecencyIndex {
+            cwd: PathBuf::from("/home/jeremy"),
+            ..RecencyIndex::default()
+        };
+        assert_eq!(index.path_key("/a/b.txt").as_ref(), "/a/b.txt");
+        assert_eq!(
+            index.path_key("/a/./b.txt").as_ref(),
+            normalized_path_key_with_cwd("/a/./b.txt", &index.cwd)
+        );
+        assert_eq!(index.path_key("b.txt").as_ref(), "/home/jeremy/b.txt");
+    }
+
+    #[test]
+    fn search_results_carry_their_snapshot() {
+        // Simulates a scope toggle where results for an old pool arrive after
+        // the pool has been swapped: indexes must resolve against the result's
+        // own snapshot.
+        let (search_tx, search_rx) = spawn_search_worker(SearchScope::Recent);
+        let snapshot: EntrySnapshot = Arc::new(vec![
+            FileEntry::new("alpha.txt".to_string()),
+            FileEntry::new("beta.txt".to_string()),
+        ]);
+        search_tx
+            .send(SearchRequest {
+                id: 1,
+                query: "beta".to_string(),
+                scope: SearchScope::Recent,
+                file_version: 7,
+                files: Arc::clone(&snapshot),
+            })
+            .unwrap();
+        let result = search_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("search result");
+        assert_eq!(result.id, 1);
+        assert!(Arc::ptr_eq(&result.files, &snapshot));
+        assert_eq!(result.files[result.matches[0].index].name(), "beta.txt");
     }
 
     #[test]
@@ -4870,8 +5134,8 @@ fn build_file_items<'a>(matches: &[MatchEntry], files: &[FileEntry]) -> Vec<List
         .iter()
         .filter_map(|matched| {
             let entry = files.get(matched.index)?;
-            let fname = &entry.name;
-            let dir = &entry.dir;
+            let fname = entry.name();
+            let dir = entry.dir();
             let (icon, icon_color) = if entry.is_dir {
                 ("\u{f115}", Color::Cyan)
             } else {
@@ -4882,7 +5146,7 @@ fn build_file_items<'a>(matches: &[MatchEntry], files: &[FileEntry]) -> Vec<List
 
             // Split filename into stem and extension
             let (stem, ext_part) = if entry.is_dir {
-                (fname.as_str(), String::new())
+                (fname, String::new())
             } else {
                 let p = Path::new(fname);
                 (
@@ -4920,10 +5184,10 @@ fn ui(frame: &mut Frame, app: &App) -> (Option<Rect>, (u16, u16)) {
 
     // Build file list items (all matches, scrolling handled by ListState)
     let (score_items, time_items, file_count) = {
-        let files = app.snapshot_for_scope(active_scope);
-        let count = files.len();
-        let score_list = build_file_items(&app.matches, files.as_ref());
-        let time_list = build_file_items(&app.matches_by_time, files.as_ref());
+        let files = app.matches_files.as_ref();
+        let count = app.snapshot_for_scope(active_scope).len();
+        let score_list = build_file_items(&app.matches, files);
+        let time_list = build_file_items(&app.matches_by_time, files);
         (score_list, time_list, count)
     };
 
