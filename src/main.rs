@@ -40,6 +40,9 @@ use syntect::parsing::SyntaxSet;
 
 const MATCH_LIMIT: usize = 50;
 const MATCH_CANDIDATE_LIMIT: usize = 1024;
+const SEARCH_WORKER_MAX: usize = 8;
+/// Below this pool size the parallel scoring fan-out costs more than it saves.
+const PARALLEL_SCORE_MIN_FILES: usize = 8_192;
 const MATCH_QUERY_CACHE_SIZE: usize = 32;
 const INCREMENTAL_QUERY_MIN_CHARS: usize = 3;
 const INCREMENTAL_ACCEPT_MIN_MATCHES: usize = 8;
@@ -279,7 +282,7 @@ impl RecencyIndex {
         }
 
         let mut candidates: Vec<(String, SystemTime)> = candidates.into_iter().collect();
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|(_, time)| std::cmp::Reverse(*time));
         candidates.into_iter().map(|(path, _)| path).collect()
     }
 }
@@ -1402,6 +1405,16 @@ fn try_begin_load(loading: &Arc<Mutex<bool>>, files: &SharedEntries) -> bool {
     true
 }
 
+/// Mutable destination state for one scope's load: accumulated entries, the
+/// dedupe set, and the publish timer.
+struct LoadDest<'a> {
+    files: &'a SharedEntries,
+    version: &'a AtomicU64,
+    seen: &'a mut HashSet<String>,
+    loaded: &'a mut Vec<FileEntry>,
+    last_publish: &'a mut Instant,
+}
+
 fn load_entries(
     files: SharedEntries,
     loading: Arc<Mutex<bool>>,
@@ -1434,14 +1447,16 @@ fn load_entries(
         // Stage 2: the old fast path, modified recently according to fd.
         load_fd_entries(
             build_fd_args(false, true),
-            &files,
-            &version,
+            LoadDest {
+                files: &files,
+                version: &version,
+                seen: &mut seen,
+                loaded: &mut loaded,
+                last_publish: &mut last_publish,
+            },
             &recency_index,
-            &mut seen,
-            &mut loaded,
             true,
             true,
-            &mut last_publish,
             None,
         );
         sort_loaded_entries(&files, &mut loaded, &version, true);
@@ -1454,14 +1469,16 @@ fn load_entries(
         let mut all_loaded = Vec::new();
         load_fd_entries(
             build_fd_args(false, false),
-            &files,
-            &version,
+            LoadDest {
+                files: &files,
+                version: &version,
+                seen: &mut seen,
+                loaded: &mut loaded,
+                last_publish: &mut last_publish,
+            },
             &recency_index,
-            &mut seen,
-            &mut loaded,
             true,
             false,
-            &mut last_publish,
             all_sink.as_ref().map(|sink| (sink, &mut all_loaded)),
         );
         if let Some(sink) = all_sink {
@@ -1471,14 +1488,16 @@ fn load_entries(
     } else {
         load_fd_entries(
             build_fd_args(dir_mode, false),
-            &files,
-            &version,
+            LoadDest {
+                files: &files,
+                version: &version,
+                seen: &mut seen,
+                loaded: &mut loaded,
+                last_publish: &mut last_publish,
+            },
             &recency_index,
-            &mut seen,
-            &mut loaded,
             false,
             false,
-            &mut last_publish,
             None,
         );
     }
@@ -1490,16 +1509,19 @@ fn load_entries(
 
 fn load_fd_entries(
     args: Vec<String>,
-    files: &SharedEntries,
-    version: &AtomicU64,
+    dest: LoadDest<'_>,
     recency_index: &Arc<RecencyIndex>,
-    seen: &mut HashSet<String>,
-    loaded: &mut Vec<FileEntry>,
     recent_only: bool,
     record_seen: bool,
-    last_publish: &mut Instant,
     mut all_out: Option<(&AllPoolSink, &mut Vec<FileEntry>)>,
 ) {
+    let LoadDest {
+        files,
+        version,
+        seen,
+        loaded,
+        last_publish,
+    } = dest;
     let mut child = match Command::new("fd")
         .args(&args)
         .stdout(Stdio::piped())
@@ -1670,7 +1692,7 @@ fn compare_entries_by_recency(a: &FileEntry, b: &FileEntry) -> Ordering {
     b.recency_time
         .cmp(&a.recency_time)
         .then_with(|| b.mtime.cmp(&a.mtime))
-        .then_with(|| a.name_lower().cmp(&b.name_lower()))
+        .then_with(|| a.name_lower().cmp(b.name_lower()))
 }
 
 fn load_files(files: SharedEntries, loading: Arc<Mutex<bool>>) {
@@ -1736,6 +1758,13 @@ impl FileEntry {
         let mut path_lower = path[..name_start].to_lowercase();
         let lower_name_start = path_lower.len();
         path_lower.push_str(&path[name_start..].to_lowercase());
+        let path: Arc<str> = path.into();
+        // Most paths are already lowercase; share one allocation for both.
+        let path_lower: Arc<str> = if path_lower == *path {
+            Arc::clone(&path)
+        } else {
+            path_lower.into()
+        };
         let is_dir = metadata.map(|m| m.is_dir()).unwrap_or(false);
         let mtime = metadata
             .and_then(|m| m.modified().ok())
@@ -1747,8 +1776,8 @@ impl FileEntry {
         let (recency_time, recency_source) = best_recency(mtime, atime, history_time, desktop_time);
 
         Self {
-            path: path.into(),
-            path_lower: path_lower.into(),
+            path,
+            path_lower,
             name_start: name_start as u32,
             lower_name_start: lower_name_start as u32,
             mtime,
@@ -2599,26 +2628,19 @@ fn score_all_files(
         .filter(|ch| !ch.is_whitespace())
         .collect();
     let query_char_count = query_compact.chars().count();
-    let mut results = Vec::new();
-    let mut warm_candidates = Vec::new();
 
-    for (index, entry) in files.iter().enumerate() {
-        if let Some(score) = file_match_score(
+    let (mut results, warm_candidates) = scan_files_parallel(files, candidate_limit, |entry| {
+        let score = file_match_score(
             &query_lower,
             &query_words,
             entry,
             false,
             query_words.len() > 1,
-        ) {
-            results.push(MatchEntry { index, score });
-        }
-
-        if warm_candidates.len() < candidate_limit
-            && is_incremental_warm_candidate(&query_compact, query_char_count, &query_words, entry)
-        {
-            warm_candidates.push(index);
-        }
-    }
+        );
+        let warm =
+            is_incremental_warm_candidate(&query_compact, query_char_count, &query_words, entry);
+        (score, warm)
+    });
 
     if should_accept_fast_match_pass(results.len(), limit, query_words.len()) {
         let (matches, candidates) = trim_sort_matches(results, limit, candidate_limit);
@@ -2626,20 +2648,87 @@ fn score_all_files(
         return (matches, candidates);
     }
 
-    let mut seen: HashSet<usize> = results.iter().map(|matched| matched.index).collect();
-    for (index, entry) in files.iter().enumerate() {
-        if seen.contains(&index) {
-            continue;
-        }
-        if let Some(score) = file_match_score(&query_lower, &query_words, entry, true, true) {
-            seen.insert(index);
-            results.push(MatchEntry { index, score });
-        }
-    }
+    let seen: HashSet<usize> = results.iter().map(|matched| matched.index).collect();
+    let (typo_results, _) = scan_files_parallel(files, 0, |entry| {
+        (
+            file_match_score(&query_lower, &query_words, entry, true, true),
+            false,
+        )
+    });
+    results.extend(
+        typo_results
+            .into_iter()
+            .filter(|matched| !seen.contains(&matched.index)),
+    );
 
     let (matches, candidates) = trim_sort_matches(results, limit, candidate_limit);
     let candidates = merge_candidate_pool(candidates, warm_candidates, candidate_limit);
     (matches, candidates)
+}
+
+/// Score every file with `score_entry`, fanning out across threads for large
+/// pools. Returned matches and warm candidates preserve file order.
+fn scan_files_parallel(
+    files: &[FileEntry],
+    warm_limit: usize,
+    score_entry: impl Fn(&FileEntry) -> (Option<f64>, bool) + Sync,
+) -> (Vec<MatchEntry>, Vec<usize>) {
+    let worker_count = if files.len() < PARALLEL_SCORE_MIN_FILES {
+        1
+    } else {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, SEARCH_WORKER_MAX)
+    };
+
+    let scan_chunk = |chunk: &[FileEntry], base: usize| {
+        let mut results = Vec::new();
+        let mut warm = Vec::new();
+        for (offset, entry) in chunk.iter().enumerate() {
+            let index = base + offset;
+            let (score, is_warm) = score_entry(entry);
+            if let Some(score) = score {
+                results.push(MatchEntry { index, score });
+            }
+            if is_warm && warm.len() < warm_limit {
+                warm.push(index);
+            }
+        }
+        (results, warm)
+    };
+
+    if worker_count <= 1 {
+        return scan_chunk(files, 0);
+    }
+
+    let chunk_size = files.len().div_ceil(worker_count);
+    let mut scanned: Vec<(Vec<MatchEntry>, Vec<usize>)> = Vec::new();
+    thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let scan_chunk = &scan_chunk;
+                scope.spawn(move || scan_chunk(chunk, chunk_index * chunk_size))
+            })
+            .collect();
+        scanned = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect();
+    });
+
+    let mut results = Vec::new();
+    let mut warm_candidates = Vec::new();
+    for (chunk_results, chunk_warm) in scanned {
+        results.extend(chunk_results);
+        if warm_candidates.len() < warm_limit {
+            let take = warm_limit - warm_candidates.len();
+            warm_candidates.extend(chunk_warm.into_iter().take(take));
+        }
+    }
+    (results, warm_candidates)
 }
 
 fn score_candidate_indexes(
@@ -2729,7 +2818,7 @@ fn is_incremental_warm_candidate(
     // Short prefixes often do not score high enough to be visible yet, but they
     // are exactly the state we want to reuse while the user continues typing.
     if query_char_count <= 2 {
-        return chars_in_order(query_compact, &entry.name_lower())
+        return chars_in_order(query_compact, entry.name_lower())
             || chars_in_order(query_compact, &entry.path_lower);
     }
 
@@ -2743,7 +2832,7 @@ fn is_incremental_warm_candidate(
     // Keep this bounded to typo-sized prefixes. Long queries should be narrowed
     // by the scored candidate list instead of a broad subsequence filter.
     query_char_count <= 6
-        && (chars_in_order(query_compact, &entry.name_lower())
+        && (chars_in_order(query_compact, entry.name_lower())
             || chars_in_order(query_compact, &entry.path_lower))
 }
 
@@ -2793,7 +2882,7 @@ fn file_match_score(
         return None;
     }
 
-    let name_score = fuzzy_match_text_score(query_words, &entry.name_lower(), 10_000.0, allow_typos);
+    let name_score = fuzzy_match_text_score(query_words, entry.name_lower(), 10_000.0, allow_typos);
     let path_score = if !include_path
         || entry.path_lower.as_ref() == entry.name_lower()
         || !should_score_path(query_lower, query_words, name_score, entry)
@@ -3709,11 +3798,7 @@ fn run_profile() -> io::Result<()> {
             let frames = shared.lock().unwrap();
             let frame_count = frames.len();
             let total_bytes: usize = frames.iter().map(|f| f.data.len()).sum();
-            let avg_frame = if frame_count > 0 {
-                total_bytes / frame_count
-            } else {
-                0
-            };
+            let avg_frame = total_bytes.checked_div(frame_count).unwrap_or(0);
 
             // Measure RSS after
             let rss_after = get_rss_kb();
@@ -3829,16 +3914,39 @@ fn bench_kitty_render(label: &str, frame: &CachedImage, iterations: usize) -> io
 fn run_bench_responsiveness() -> io::Result<()> {
     eprintln!("=== Responsiveness Benchmark ===");
 
-    let files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
-    let loading = Arc::new(Mutex::new(true));
-    let start = Instant::now();
-    load_files(Arc::clone(&files), Arc::clone(&loading));
-    let files = Arc::clone(&files.lock().unwrap());
-    eprintln!(
-        "bench: loaded {} files for responsiveness benchmark in {:?}",
-        files.len(),
-        start.elapsed()
-    );
+    // FFP_BENCH_SYNTHETIC=N benchmarks against N generated entries instead of
+    // the real recent pool, matching all-files (Ctrl+Z) scale.
+    let files: EntrySnapshot = if let Ok(synthetic) = env::var("FFP_BENCH_SYNTHETIC") {
+        let count: usize = synthetic.parse().unwrap_or(600_000);
+        let start = Instant::now();
+        let entries: Vec<FileEntry> = (0..count)
+            .map(|i| {
+                FileEntry::from_metadata(
+                    format!("/home/user/project-{}/src/module_{}/file_{}.rs", i % 977, i % 53, i),
+                    None,
+                    &RecencyIndex::default(),
+                )
+            })
+            .collect();
+        eprintln!(
+            "bench: generated {} synthetic files in {:?}",
+            entries.len(),
+            start.elapsed()
+        );
+        Arc::new(entries)
+    } else {
+        let files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
+        let loading = Arc::new(Mutex::new(true));
+        let start = Instant::now();
+        load_files(Arc::clone(&files), Arc::clone(&loading));
+        let files = Arc::clone(&files.lock().unwrap());
+        eprintln!(
+            "bench: loaded {} files for responsiveness benchmark in {:?}",
+            files.len(),
+            start.elapsed()
+        );
+        files
+    };
 
     let (search_tx, search_rx) = spawn_search_worker(SearchScope::Recent);
     let queries = env::var("FFP_BENCH_QUERIES").unwrap_or_else(|_| "m,ma,mai,main,doc,rs".into());
