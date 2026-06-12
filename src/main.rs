@@ -2219,7 +2219,12 @@ fn video_render_decision(
 /// responsible for flushing and for hiding/showing the cursor so that
 /// the entire write (cursor-hide + kitty data + cursor-restore) lands
 /// in a single `flush()` call, preventing partial-write flicker.
-fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) -> io::Result<()> {
+fn render_kitty_image_to(
+    img: &CachedImage,
+    area: Rect,
+    image_id: u32,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let cell_ratio = 2.0_f64;
     let img_ratio = (img.width as f64 / img.height as f64) * cell_ratio;
     let area_ratio = area.width as f64 / area.height as f64;
@@ -2259,7 +2264,8 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
             if img.is_raw_rgb {
                 write!(
                     out,
-                    "\x1b_Ga=T,q=2,i=1,C=1,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
+                    "\x1b_Ga=T,q=2,i={},C=1,f=24,s={},v={},c={},r={},m={};{}\x1b\\",
+                    image_id,
                     img.width,
                     img.height,
                     cols,
@@ -2270,7 +2276,8 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
             } else {
                 write!(
                     out,
-                    "\x1b_Ga=T,q=2,i=1,C=1,f=100,c={},r={},m={};{}\x1b\\",
+                    "\x1b_Ga=T,q=2,i={},C=1,f=100,c={},r={},m={};{}\x1b\\",
+                    image_id,
                     cols,
                     rows,
                     if is_last { 0 } else { 1 },
@@ -2290,20 +2297,49 @@ fn render_kitty_image_to(img: &CachedImage, area: Rect, out: &mut impl Write) ->
     Ok(())
 }
 
+/// The two kitty image ids used for double-buffered preview rendering.
+const KITTY_IMAGE_IDS: [u32; 2] = [1, 2];
+
+/// Double buffer for kitty graphics: frames alternate between two image
+/// ids so a new frame is always drawn on top of the previous placement
+/// before the old image is deleted. Retransmitting one id would make
+/// kitty drop the visible image first and blank the area until the new
+/// payload decodes, which reads as per-frame flicker.
+struct KittyDoubleBuffer {
+    /// Index into KITTY_IMAGE_IDS of the currently displayed image.
+    current: usize,
+}
+
+impl KittyDoubleBuffer {
+    fn new() -> Self {
+        Self { current: 0 }
+    }
+
+    /// Flip buffers, returning `(new_id, old_id)` for the next frame.
+    fn flip(&mut self) -> (u32, u32) {
+        let old = KITTY_IMAGE_IDS[self.current];
+        self.current = 1 - self.current;
+        (KITTY_IMAGE_IDS[self.current], old)
+    }
+}
+
 /// Render image using kitty graphics protocol.
 ///
-/// Composes one atomic buffer: hide cursor, draw the image, move the
-/// cursor back to the input field, show it again, then a single
+/// Composes one atomic buffer: hide cursor, draw the new frame under a
+/// fresh image id, delete the previously displayed id, move the cursor
+/// back to the input field, show it again, then a single
 /// write_all + flush. The cursor-move into the preview area therefore
-/// always happens while the cursor is hidden, and visibility is only
-/// restored after the cursor is back at the input field.
-///
-/// Without this, the visible block cursor jumps into the preview area on
-/// every video frame and sits there until the next ratatui draw
-/// repositions it, which shows up as a flickering block over the video.
-fn render_kitty_image(img: &CachedImage, area: Rect, cursor_pos: (u16, u16)) -> io::Result<()> {
-    let mut buf: Vec<u8> = Vec::with_capacity(img.data.len() * 2 + 32);
-    compose_kitty_render(img, area, cursor_pos, &mut buf)?;
+/// always happens while the cursor is hidden, and the old frame stays
+/// on screen until the new one covers it (no blank gap between frames).
+fn render_kitty_image(
+    img: &CachedImage,
+    area: Rect,
+    cursor_pos: (u16, u16),
+    dbuf: &mut KittyDoubleBuffer,
+) -> io::Result<()> {
+    let (new_id, old_id) = dbuf.flip();
+    let mut buf: Vec<u8> = Vec::with_capacity(img.data.len() * 2 + 64);
+    compose_kitty_render(img, area, cursor_pos, new_id, old_id, &mut buf)?;
     let mut out = io::stdout().lock();
     out.write_all(&buf)?;
     out.flush()?;
@@ -2311,17 +2347,23 @@ fn render_kitty_image(img: &CachedImage, area: Rect, cursor_pos: (u16, u16)) -> 
 }
 
 /// Build the full atomic render sequence for one frame:
-/// `hide cursor` + `kitty image` + `cursor back to input` + `show cursor`.
+/// `hide cursor` + `kitty image (new id)` + `delete old id` +
+/// `cursor back to input` + `show cursor`.
 /// Everything must land in one buffer so a terminal can never paint an
-/// intermediate state with a visible cursor inside the preview area.
+/// intermediate state: no visible cursor inside the preview area, and no
+/// moment where neither frame is displayed.
 fn compose_kitty_render(
     img: &CachedImage,
     area: Rect,
     cursor_pos: (u16, u16),
+    new_id: u32,
+    old_id: u32,
     out: &mut impl Write,
 ) -> io::Result<()> {
     write!(out, "\x1b[?25l")?;
-    render_kitty_image_to(img, area, out)?;
+    render_kitty_image_to(img, area, new_id, out)?;
+    // Delete the previous frame only after the new one is placed over it.
+    write!(out, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", old_id)?;
     write!(
         out,
         "\x1b[{};{}H\x1b[?25h",
@@ -2333,7 +2375,9 @@ fn compose_kitty_render(
 
 /// Clear any kitty graphics
 fn clear_kitty_image_to(out: &mut impl Write) -> io::Result<()> {
-    write!(out, "\x1b_Ga=d,d=I,i=1,q=2\x1b\\")?;
+    for id in KITTY_IMAGE_IDS {
+        write!(out, "\x1b_Ga=d,d=I,i={},q=2\x1b\\", id)?;
+    }
     out.flush()?;
     Ok(())
 }
@@ -3914,7 +3958,7 @@ fn bench_kitty_render(label: &str, frame: &CachedImage, iterations: usize) -> io
     for _ in 0..iterations {
         let mut out = Vec::with_capacity(frame.data.len() * 2);
         let start = Instant::now();
-        render_kitty_image_to(frame, area, &mut out)?;
+        render_kitty_image_to(frame, area, 1, &mut out)?;
         samples.push(start.elapsed());
         bytes = out.len();
     }
@@ -4538,7 +4582,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         let cmds = parse_kitty_commands(&output);
@@ -4575,7 +4619,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         let cmds = parse_kitty_commands(&output);
@@ -4610,7 +4654,7 @@ mod tests {
             height: 20,
         };
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         let cmds = parse_kitty_commands(&output);
@@ -4657,7 +4701,7 @@ mod tests {
             height: 10,
         };
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         assert!(
@@ -4695,7 +4739,7 @@ mod tests {
         let cursor_pos = (15u16, 1u16);
 
         let mut buf = Vec::new();
-        compose_kitty_render(&img, area, cursor_pos, &mut buf).unwrap();
+        compose_kitty_render(&img, area, cursor_pos, 2, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf).to_string();
 
         let hide = output.find("\x1b[?25l").expect("must hide cursor first");
@@ -4722,6 +4766,56 @@ mod tests {
             "buffer must end with the cursor visible at the input field"
         );
         assert!(show > kitty);
+
+        // Double-buffer ordering: the new frame (i=2) must be fully
+        // transmitted before the old frame (i=1) is deleted, so the area is
+        // never blank between frames.
+        let new_frame = output.find("i=2").expect("new frame id present");
+        let delete_old = output
+            .find("\x1b_Ga=d,d=I,i=1,q=2\x1b\\")
+            .expect("must delete the old frame id");
+        assert!(
+            new_frame < delete_old,
+            "old frame must only be deleted after the new frame is placed"
+        );
+        assert!(
+            delete_old < restore,
+            "delete must happen inside the atomic buffer before cursor restore"
+        );
+    }
+
+    /// Frames must alternate between the two kitty image ids, always
+    /// deleting the id rendered two frames ago, never the one just drawn.
+    #[test]
+    fn kitty_double_buffer_alternates_ids() {
+        let mut dbuf = KittyDoubleBuffer::new();
+        let (a_new, a_old) = dbuf.flip();
+        let (b_new, b_old) = dbuf.flip();
+        let (c_new, c_old) = dbuf.flip();
+
+        assert_ne!(a_new, a_old, "new and old ids must differ");
+        assert_eq!(b_old, a_new, "next flip deletes the previous frame");
+        assert_eq!(c_new, a_new, "ids alternate with period two");
+        assert_eq!(c_old, b_new);
+        for id in [a_new, a_old, b_new, b_old] {
+            assert!(KITTY_IMAGE_IDS.contains(&id));
+        }
+    }
+
+    /// A full clear must delete both double-buffer ids, otherwise one frame
+    /// can survive a preview-area collapse.
+    #[test]
+    fn kitty_clear_removes_both_buffers() {
+        let mut buf = Vec::new();
+        clear_kitty_image_to(&mut buf).unwrap();
+        let output = String::from_utf8_lossy(&buf);
+        for id in KITTY_IMAGE_IDS {
+            assert!(
+                output.contains(&format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", id)),
+                "clear must delete image id {}",
+                id
+            );
+        }
     }
 
     /// `C=1` tells kitty not to move the cursor after drawing the image, so
@@ -4741,7 +4835,7 @@ mod tests {
             height: 5,
         };
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
         let cmds = parse_kitty_commands(&output);
         assert!(!cmds.is_empty());
@@ -4766,7 +4860,7 @@ mod tests {
             height: 10,
         };
         let mut buf: Vec<u8> = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         assert!(
@@ -4811,7 +4905,7 @@ mod tests {
             height: 20,
         };
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         let cmds = parse_kitty_commands(&output);
@@ -4842,7 +4936,7 @@ mod tests {
             height: 40,
         };
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         let cmds = parse_kitty_commands(&output);
@@ -5066,7 +5160,7 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        render_kitty_image_to(&img, area, &mut buf).unwrap();
+        render_kitty_image_to(&img, area, 1, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
 
         assert!(
@@ -5098,7 +5192,7 @@ mod tests {
 
         let mut combined = Vec::new();
         for frame in &frames {
-            render_kitty_image_to(frame, area, &mut combined).unwrap();
+            render_kitty_image_to(frame, area, 1, &mut combined).unwrap();
         }
         let output = String::from_utf8_lossy(&combined);
 
@@ -5226,7 +5320,7 @@ mod tests {
             ) {
                 if let Some(frame) = frames.get(idx) {
                     let mut buf: Vec<u8> = Vec::new();
-                    compose_kitty_render(frame, area, cursor_input, &mut buf).unwrap();
+                    compose_kitty_render(frame, area, cursor_input, 2, 1, &mut buf).unwrap();
                     terminal_bytes.extend_from_slice(&buf);
                 }
                 last_rendered_path = preview_path.to_string();
@@ -5967,6 +6061,7 @@ fn run_bench_flicker() -> io::Result<()> {
         let mut video_frame_time = Instant::now();
         let mut last_rendered_path = String::new();
         let preview_path = "/bench/video.mp4";
+        let mut dbuf = KittyDoubleBuffer::new();
 
         for cycle in 0..120 {
             // Simulate ratatui draw output (cursor show at input)
@@ -5993,7 +6088,8 @@ fn run_bench_flicker() -> io::Result<()> {
             ) {
                 if let Some(frame) = frames.get(idx) {
                     let mut buf: Vec<u8> = Vec::with_capacity(frame.data.len() * 2);
-                    compose_kitty_render(frame, area, cursor_input, &mut buf)?;
+                    let (new_id, old_id) = dbuf.flip();
+                    compose_kitty_render(frame, area, cursor_input, new_id, old_id, &mut buf)?;
                     recorder.write_all(&buf)?;
                     recorder.flush()?;
                 }
@@ -6041,7 +6137,7 @@ fn run_bench_flicker() -> io::Result<()> {
                     // Old approach: write directly, each write! is a separate syscall
                     write!(recorder, "\x1b[?25l")?;
                     recorder.flush()?;
-                    render_kitty_image_to(frame, area, &mut recorder)?;
+                    render_kitty_image_to(frame, area, 1, &mut recorder)?;
                     recorder.flush()?;
                     write!(recorder, "\x1b[?25h")?;
                     recorder.flush()?;
@@ -6334,6 +6430,7 @@ fn main() -> io::Result<()> {
 
     let mut last_image_area: Option<Rect> = None;
     let mut last_rendered_path = String::new();
+    let mut kitty_dbuf = KittyDoubleBuffer::new();
     let mut last_input_time: Option<Instant> = None;
     let mut pending_input_render: Option<(Instant, usize)> = None;
 
@@ -6406,7 +6503,7 @@ fn main() -> io::Result<()> {
                     PreviewContent::Image(ref img) => {
                         if app.preview_path != last_rendered_path {
                             let render_start = Instant::now();
-                            let _ = render_kitty_image(img, inner, cursor_pos);
+                            let _ = render_kitty_image(img, inner, cursor_pos, &mut kitty_dbuf);
                             trace.log_duration(
                                 "kitty_image_render",
                                 render_start.elapsed(),
@@ -6434,7 +6531,7 @@ fn main() -> io::Result<()> {
                         ) {
                             if let Some(frame) = frames.get(idx) {
                                 let render_start = Instant::now();
-                                let _ = render_kitty_image(frame, inner, cursor_pos);
+                                let _ = render_kitty_image(frame, inner, cursor_pos, &mut kitty_dbuf);
                                 trace.log_duration(
                                     "kitty_video_render",
                                     render_start.elapsed(),
