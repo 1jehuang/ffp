@@ -49,11 +49,11 @@ const INCREMENTAL_ACCEPT_MIN_MATCHES: usize = 8;
 const FILE_BATCH_SIZE: usize = 256;
 const ENTRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 const STAT_WORKER_MAX: usize = 8;
-const FILE_LOOKBACK_WINDOW: &str = "9d";
-const FILE_LOOKBACK_WINDOW_SECS: u64 = 9 * 24 * 60 * 60;
+const FILE_LOOKBACK_WINDOW: &str = "1month";
+const FILE_LOOKBACK_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 /// UI label for the recent scope, including the lookback cutoff.
 /// Keep in sync with FILE_LOOKBACK_WINDOW.
-const RECENT_SCOPE_LABEL: &str = "recent (9d)";
+const RECENT_SCOPE_LABEL: &str = "recent (1month)";
 const RECENT_POOL_LIMIT: usize = 20_000;
 const IMAGE_CACHE_SIZE: usize = 10;
 const THUMBNAIL_MAX_WIDTH: u32 = 800;
@@ -543,7 +543,7 @@ struct App {
 }
 
 impl App {
-    fn new(dir_mode: bool) -> Self {
+    fn new(dir_mode: bool, start_all: bool) -> Self {
         let recent_files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
         let all_files: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
         let dir_entries: SharedEntries = Arc::new(Mutex::new(Arc::new(Vec::new())));
@@ -555,6 +555,8 @@ impl App {
         let dir_loading = Arc::new(Mutex::new(false));
         let recency_index = Arc::new(RecencyIndex::load());
         let search_scope = if dir_mode {
+            SearchScope::All
+        } else if start_all {
             SearchScope::All
         } else {
             SearchScope::Recent
@@ -6502,6 +6504,7 @@ fn main() -> io::Result<()> {
     let mut trace = TraceLogger::new(&args);
     let drag_mode = args.iter().any(|arg| arg == "--drag");
     let dir_mode = args.iter().any(|arg| arg == "--dir");
+    let start_all = args.iter().any(|arg| arg == "--all");
     let selection_path = args
         .iter()
         .position(|arg| arg == "--selection-path")
@@ -6524,7 +6527,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(dir_mode);
+    let mut app = App::new(dir_mode, start_all);
     app.drag_mode = drag_mode;
     let mut chosen: Option<ExitAction> = None;
 
