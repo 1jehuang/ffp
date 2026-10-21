@@ -50,6 +50,14 @@ const FILE_BATCH_SIZE: usize = 256;
 const ENTRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 const STAT_WORKER_MAX: usize = 8;
 const FILE_LOOKBACK_WINDOW: &str = "1month";
+
+/// When set (via `--media`), file searches only return images and videos.
+static MEDIA_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "svg", "heic", "heif", "avif",
+    "ico", "raw", "cr2", "nef", "dng", "mp4", "mkv", "webm", "mov", "avi", "m4v", "wmv", "flv",
+    "mpg", "mpeg", "3gp", "ogv",
+];
 const FILE_LOOKBACK_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
 /// UI label for the recent scope, including the lookback cutoff.
 /// Keep in sync with FILE_LOOKBACK_WINDOW.
@@ -1339,6 +1347,13 @@ fn build_fd_args(dir_mode: bool, recent_only: bool) -> Vec<String> {
     if recent_only && !dir_mode {
         args.push("--changed-within".to_string());
         args.push(FILE_LOOKBACK_WINDOW.to_string());
+    }
+
+    if !dir_mode && MEDIA_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        for ext in MEDIA_EXTENSIONS {
+            args.push("-e".to_string());
+            args.push(ext.to_string());
+        }
     }
 
     args.extend([
@@ -6505,6 +6520,9 @@ fn main() -> io::Result<()> {
     let drag_mode = args.iter().any(|arg| arg == "--drag");
     let dir_mode = args.iter().any(|arg| arg == "--dir");
     let start_all = args.iter().any(|arg| arg == "--all");
+    if args.iter().any(|arg| arg == "--media") {
+        MEDIA_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let selection_path = args
         .iter()
         .position(|arg| arg == "--selection-path")
